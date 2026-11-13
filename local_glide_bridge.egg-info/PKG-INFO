@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: local-glide-bridge
+Version: 0.1.0
+Summary: Stream Glide robot telemetry from ROS 2 (via rosbridge) to local Python tools
+Requires-Python: <3.14,>=3.10
+Requires-Dist: roslibpy>=1.7
+Requires-Dist: numpy>=1.26
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: pillow>=10
+Requires-Dist: mcap>=1.6.0
+Requires-Dist: mcap-ros2-support>=0.6.0

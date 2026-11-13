@@ -1,0 +1,30 @@
+[project]
+name = "local-glide-bridge"
+version = "0.1.0"
+description = "Stream Glide robot telemetry from ROS 2 (via rosbridge) to local Python tools"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "roslibpy>=1.7",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "pillow>=10",
+    "mcap>=1.6.0",
+    "mcap-ros2-support>=0.6.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+packages = ["glide_bridge"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+# roslibpy -> autobahn -> cbor2/cryptography. Their newest releases ship no
+# Intel-Mac (x86_64) wheels and need a Rust toolchain to build, so cap them at
+# the last versions with wheels, and never build them from source.
+constraint-dependencies = ["autobahn<=24.4.2", "cbor2<=5.9.0", "cryptography<=48.0.1"]
+no-build-package = ["cbor2", "cryptography", "autobahn"]

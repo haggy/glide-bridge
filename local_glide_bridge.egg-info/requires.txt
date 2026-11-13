@@ -1,0 +1,6 @@
+roslibpy>=1.7
+numpy>=1.26
+matplotlib>=3.8
+pillow>=10
+mcap>=1.6.0
+mcap-ros2-support>=0.6.0
