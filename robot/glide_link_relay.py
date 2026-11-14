@@ -40,6 +40,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict
+from typing import Any
 
 import cv2
 import numpy as np
@@ -64,7 +65,8 @@ SUB_QOS = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=2,
 
 # --------------------------------------------------------------------- encoding
 
-def _jsonable(o):
+def _jsonable(o: Any) -> Any:
+    """``json.dumps`` fallback: bytes/arrays/sequences -> lists, non-finite floats -> None."""
     if isinstance(o, (bytes, bytearray)):
         return list(o)
     if isinstance(o, np.ndarray):
@@ -77,15 +79,33 @@ def _jsonable(o):
         return str(o)
 
 
-def _stamp(msg) -> float | None:
+def _stamp(msg: Any) -> float | None:
+    """Header stamp of a ROS message in seconds, or None if it has no header."""
     h = getattr(msg, "header", None)
     if h is None:
         return None
     return h.stamp.sec + h.stamp.nanosec * 1e-9
 
 
-def _image_array(msg) -> np.ndarray:
-    """sensor_msgs/Image -> array (H, W[, C]), honouring row padding."""
+def _image_array(msg: Any) -> np.ndarray:
+    """Convert a ``sensor_msgs/Image`` to a numpy array.
+
+    Parameters
+    ----------
+    msg : sensor_msgs.msg.Image
+        Raw image message.
+
+    Returns
+    -------
+    np.ndarray
+        (H, W) or (H, W, C) array in native byte order; dtype follows the encoding
+        (uint8 color/mono, uint16 for 16UC1/mono16, float32 for 32FC1).
+
+    Notes
+    -----
+    Rows may be padded: each row is ``msg.step`` bytes, of which only
+    ``width * channels * itemsize`` hold pixels.
+    """
     enc = msg.encoding.lower()
     if enc in ("16uc1", "mono16"):
         dtype, ch = np.dtype(np.uint16), 1
@@ -102,20 +122,45 @@ def _image_array(msg) -> np.ndarray:
     if msg.is_bigendian:
         dtype = dtype.newbyteorder(">")
     h, w = msg.height, msg.width
-    row = np.frombuffer(bytes(msg.data), np.uint8).reshape(h, msg.step)
+    row: np.ndarray = np.frombuffer(bytes(msg.data), np.uint8).reshape(h, msg.step)  # (H, step) bytes
     row = row[:, : w * ch * dtype.itemsize]
-    arr = row.copy().view(dtype).reshape((h, w, ch) if ch > 1 else (h, w))
+    arr: np.ndarray = row.copy().view(dtype).reshape((h, w, ch) if ch > 1 else (h, w))
     return arr.astype(dtype.newbyteorder("="), copy=False)
 
 
-def encode_image(msg, lossless: bool, quality: int) -> tuple[dict, bytes]:
+def encode_image(msg: Any, lossless: bool, quality: int) -> tuple[dict, bytes]:
+    """Encode a ``sensor_msgs/Image`` for the wire.
+
+    Parameters
+    ----------
+    msg : sensor_msgs.msg.Image
+        Image to encode.
+    lossless : bool
+        PNG instead of JPEG for color images.
+    quality : int
+        JPEG quality (0-100) for lossy color.
+
+    Returns
+    -------
+    meta : dict
+        Header fields: width, height, src_encoding, frame_id, enc (jpeg | png |
+        png16) and, for png16, unit (mm | raw).
+    payload : bytes
+        Encoded image.
+
+    Notes
+    -----
+    Mono/IR/label images are always PNG so labels survive. float32 depth (m) is
+    sent as 16-bit PNG in millimetres: ``mm = clip(round(1000 * m), 0, 65535)``
+    with NaN/inf mapped to 0 (no reading).
+    """
     enc = msg.encoding.lower()
-    arr = _image_array(msg)
-    meta = {"width": msg.width, "height": msg.height, "src_encoding": msg.encoding,
+    arr: np.ndarray = _image_array(msg)
+    meta: dict = {"width": msg.width, "height": msg.height, "src_encoding": msg.encoding,
             "frame_id": msg.header.frame_id}
     if enc in COLOR_ENCODINGS:
         if enc.startswith("rgb"):
-            bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR if arr.shape[2] == 4 else cv2.COLOR_RGB2BGR)
+            bgr: np.ndarray = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR if arr.shape[2] == 4 else cv2.COLOR_RGB2BGR)
         else:
             bgr = arr[..., :3]
         if lossless:
@@ -143,7 +188,10 @@ def encode_image(msg, lossless: bool, quality: int) -> tuple[dict, bytes]:
     return meta, buf.tobytes()
 
 
-def encode_message(msg, type_name: str, lossless: bool, quality: int) -> tuple[dict, bytes]:
+def encode_message(msg: Any, type_name: str, lossless: bool,
+                   quality: int) -> tuple[dict, bytes]:
+    """Encode any ROS message: images via :func:`encode_image`, CompressedImage
+    passed through, everything else as JSON. Returns (header fields, payload)."""
     if type_name == "sensor_msgs/msg/Image":
         return encode_image(msg, lossless, quality)
     if type_name == "sensor_msgs/msg/CompressedImage":
@@ -156,11 +204,13 @@ def encode_message(msg, type_name: str, lossless: bool, quality: int) -> tuple[d
 # ---------------------------------------------------------------------- framing
 
 def pack(header: dict, payload: bytes = b"") -> bytes:
+    """Frame a message: ``!II`` (header_len, payload_len), JSON header, payload."""
     h = json.dumps(header, default=_jsonable).encode()
     return HDR.pack(len(h), len(payload)) + h + payload
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
+    """Read exactly ``n`` bytes; raises ConnectionError if the peer closes first."""
     buf = bytearray()
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -171,6 +221,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def recv_frame(sock: socket.socket) -> tuple[dict, bytes]:
+    """Read one framed message. Returns (JSON header, payload bytes)."""
     hl, pl = HDR.unpack(recv_exact(sock, HDR.size))
     if hl > MAX_HEADER:
         raise ConnectionError("header too large")
@@ -182,7 +233,10 @@ def recv_frame(sock: socket.socket) -> tuple[dict, bytes]:
 # ---------------------------------------------------------------------- clients
 
 class Client:
-    def __init__(self, sock: socket.socket, addr, relay: "Relay"):
+    """One connected laptop: its subscriptions and an outgoing queue drained by
+    :meth:`writer` on its own thread."""
+
+    def __init__(self, sock: socket.socket, addr: tuple[str, int], relay: "Relay") -> None:
         self.sock, self.addr, self.relay = sock, addr, relay
         self.subs: dict[str, dict] = {}        # topic -> {max_rate, lossless, last_sent}
         self.pending: "OrderedDict[str, list[bytes]]" = OrderedDict()
@@ -192,6 +246,8 @@ class Client:
         self.sent_bytes = 0
 
     def wants(self, topic: str, now: float) -> dict | None:
+        """Subscription settings if this client should get ``topic`` now (rate cap
+        honoured with 5% slack), else None."""
         s = self.subs.get(topic)
         if s is None:
             return None
@@ -200,9 +256,22 @@ class Client:
             return None
         return s
 
-    def offer(self, topic: str, frame: bytes, now: float, keep_all: bool = False):
-        """Queue a frame. Images keep only the newest; small messages (keep_all) queue
-        up to 500 so odometry and IMU arrive complete."""
+    def offer(self, topic: str, frame: bytes, now: float, keep_all: bool = False) -> None:
+        """Queue a packed frame for sending.
+
+        Parameters
+        ----------
+        topic : str
+            Topic the frame belongs to.
+        frame : bytes
+            Packed frame (see :func:`pack`).
+        now : float
+            Current time.time(), recorded for the rate cap.
+        keep_all : bool
+            Queue up to 500 messages instead of keeping only the newest. Used for
+            small JSON messages so odometry and IMU arrive complete; images keep
+            only the newest frame.
+        """
         with self.cv:
             sub = self.subs.get(topic)
             if sub is None:          # unsubscribed meanwhile
@@ -217,12 +286,13 @@ class Client:
             self.pending.move_to_end(topic)
             self.cv.notify()
 
-    def send_control(self, frame: bytes):
+    def send_control(self, frame: bytes) -> None:
         with self.cv:
             self.control.append(frame)
             self.cv.notify()
 
-    def writer(self):
+    def writer(self) -> None:
+        """Thread body: send control frames, then pending frames, until closed."""
         try:
             while self.alive:
                 with self.cv:
@@ -238,7 +308,8 @@ class Client:
         finally:
             self.close()
 
-    def reader(self):
+    def reader(self) -> None:
+        """Thread body: read client requests and pass them to the relay."""
         try:
             while self.alive:
                 header, _ = recv_frame(self.sock)
@@ -248,7 +319,7 @@ class Client:
         finally:
             self.close()
 
-    def close(self):
+    def close(self) -> None:
         if not self.alive:
             return
         self.alive = False
@@ -265,25 +336,29 @@ class Client:
 # ------------------------------------------------------------------------ relay
 
 class Relay(Node):
-    def __init__(self, args):
+    """ROS 2 node that subscribes to topics on demand and fans them out to clients."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
         super().__init__("glide_link_relay")
         self.args = args
         self.lock = threading.Lock()
         self.peers: list[Client] = []
-        self.ros_subs: dict[str, object] = {}  # topic -> rclpy subscription
+        self.ros_subs: dict[str, Any] = {}  # topic -> rclpy subscription
         self.types: dict[str, str] = {}
         self.seq: dict[str, int] = {}
         self.wanted: set[str] = set()
         self.errors: dict[str, str] = {}
         self.create_timer(1.0, self._resolve_pending)
         self.create_timer(args.stats_every, self._log_stats) if args.stats_every > 0 else None
-        self._last_stats = (time.time(), 0)
+        self._last_stats: tuple[float, int] = (time.time(), 0)
 
     # --- ROS side
     def topic_table(self) -> dict[str, str]:
+        """Topics in the ROS graph: name -> first advertised type."""
         return {name: types[0] for name, types in self.get_topic_names_and_types()}
 
-    def _resolve_pending(self):
+    def _resolve_pending(self) -> None:
+        """Timer: subscribe to wanted topics whose publishers have appeared."""
         with self.lock:
             missing = [t for t in self.wanted if t not in self.ros_subs]
         if not missing:
@@ -293,7 +368,7 @@ class Relay(Node):
             if topic in table:
                 self._subscribe_ros(topic, table[topic])
 
-    def _subscribe_ros(self, topic: str, type_name: str):
+    def _subscribe_ros(self, topic: str, type_name: str) -> None:
         try:
             cls = get_message(type_name)
         except Exception as exc:  # message package not on this machine
@@ -328,7 +403,8 @@ class Relay(Node):
                           reliability=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT,
                           durability=DurabilityPolicy.TRANSIENT_LOCAL if latched else DurabilityPolicy.VOLATILE)
 
-    def _on_msg(self, topic: str, msg):
+    def _on_msg(self, topic: str, msg: Any) -> None:
+        """ROS callback: encode once per lossless setting and offer to each client."""
         now = time.time()
         with self.lock:
             self.seq[topic] += 1
@@ -356,7 +432,7 @@ class Relay(Node):
             client.offer(topic, encoded[lossless], now, keep_all=meta["enc"] == "json")
 
     # --- client side
-    def add_client(self, sock, addr):
+    def add_client(self, sock: socket.socket, addr: tuple[str, int]) -> None:
         c = Client(sock, addr, self)
         with self.lock:
             self.peers.append(c)
@@ -366,7 +442,7 @@ class Relay(Node):
         threading.Thread(target=c.writer, daemon=True).start()
         threading.Thread(target=c.reader, daemon=True).start()
 
-    def drop_client(self, c: Client):
+    def drop_client(self, c: Client) -> None:
         with self.lock:
             if c in self.peers:
                 self.peers.remove(c)
@@ -379,7 +455,8 @@ class Relay(Node):
         self.get_logger().info(f"client disconnected {c.addr[0]}:{c.addr[1]} "
                                f"({c.sent_bytes / 1e6:.1f} MB sent)")
 
-    def handle_request(self, c: Client, req: dict):
+    def handle_request(self, c: Client, req: dict) -> None:
+        """Handle one client request (subscribe, unsubscribe, list, ping)."""
         op = req.get("op")
         if op == "subscribe":
             table = None
@@ -418,13 +495,13 @@ class Relay(Node):
         elif op == "ping":
             c.send_control(pack({"op": "pong", "t": req.get("t"), "relay_time": time.time()}))
 
-    def _broadcast_status(self, topic, state, **extra):
+    def _broadcast_status(self, topic: str, state: str, **extra: Any) -> None:
         with self.lock:
             clients = [c for c in self.peers if topic in c.subs]
         for c in clients:
             c.send_control(pack(dict({"op": "status", "topic": topic, "state": state}, **extra)))
 
-    def _log_stats(self):
+    def _log_stats(self) -> None:
         with self.lock:
             sent = sum(c.sent_bytes for c in self.peers)
             n = len(self.peers)
@@ -436,7 +513,8 @@ class Relay(Node):
         self._last_stats = (now, sent)
 
 
-def serve(relay: Relay, host: str, port: int):
+def serve(relay: Relay, host: str, port: int) -> None:
+    """Accept TCP clients forever and hand each to the relay."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -448,7 +526,7 @@ def serve(relay: Relay, host: str, port: int):
         relay.add_client(sock, addr)
 
 
-def main():
+def main() -> None:
     p = argparse.ArgumentParser(description="Serve ROS 2 topics to glide_bridge clients over TCP")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8770)

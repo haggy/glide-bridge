@@ -17,16 +17,20 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
+from matplotlib.axes import Axes
+from matplotlib.image import AxesImage
 
-from glide_bridge import DEFAULT_STREAMS, PRESETS, GlideBridge, GlideLink
+from glide_bridge import DEFAULT_STREAMS, PRESETS, CameraFeed, GlideBridge, GlideLink, TopicFeed
 from glide_bridge.link import DEFAULT_PORT
 
 
 def parse_args() -> argparse.Namespace:
+    """Command-line options (see the module docstring for examples)."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="10.42.0.45",
@@ -52,6 +56,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Connect, open one panel per stream and animate until the window closes.
+
+    Returns
+    -------
+    int
+        Exit code: 0 ok, 1 connection failed or a snapshot stream had no frames,
+        2 unknown stream name.
+    """
     args = parse_args()
     preset = PRESETS[args.preset]
     args.streams = args.streams or DEFAULT_STREAMS.get(args.preset, list(preset)[:2])
@@ -65,7 +77,7 @@ def main() -> int:
     print(f"Connecting to {args.backend} at {args.host}:{args.port} ...")
     try:
         if args.backend == "link":
-            bridge = GlideLink(args.host, args.port)
+            bridge: GlideLink | GlideBridge = GlideLink(args.host, args.port)
         else:
             bridge = GlideBridge(args.host, args.port)
     except Exception as exc:
@@ -75,10 +87,10 @@ def main() -> int:
         return 1
 
     if args.backend == "link":
-        feeds = []
+        feeds: list[TopicFeed | CameraFeed] = []
         for name in args.streams:
-            feed = bridge.subscribe(preset[name].base_topic, max_rate=args.max_rate)
-            feed.stream = preset[name]
+            feed: Any = bridge.subscribe(preset[name].base_topic, max_rate=args.max_rate)
+            feed.stream = preset[name]   # TopicFeed has no .stream; the viewer adds it
             feeds.append(feed)
     else:
         feeds = [bridge.add_camera(preset[name], args.transport, args.max_rate)
@@ -95,7 +107,7 @@ def main() -> int:
     for ax in axes.flat[n:]:
         ax.set_visible(False)
 
-    artists = {}
+    artists: dict[str, tuple[Axes, AxesImage, list[Any]]] = {}   # name -> (ax, image, [last frame])
     for ax, feed in zip(axes.flat, feeds):
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_title(f"{feed.stream.name}: waiting for {feed.topic_name}", fontsize=9)
@@ -114,7 +126,8 @@ def main() -> int:
             im = ax.imshow(np.zeros((2, 2, 3), np.uint8))
         artists[feed.stream.name] = (ax, im, [None])   # [last frame shown]
 
-    def update(_):
+    def update(_: int | None) -> list:
+        """Animation callback: draw each feed's newest frame if it changed."""
         for feed in feeds:
             ax, im, shown = artists[feed.stream.name]
             frame = feed.latest()
@@ -127,7 +140,7 @@ def main() -> int:
             if frame is shown[0]:
                 continue
             shown[0] = frame
-            img = frame.image
+            img: np.ndarray = frame.image   # (H, W, 3) uint8 RGB, (H, W) float32 m, or (H, W) uint8
             if im.get_array().shape[:2] != img.shape[:2]:
                 im.set_extent((-0.5, img.shape[1] - 0.5, img.shape[0] - 0.5, -0.5))
             im.set_data(np.ma.masked_equal(img, 0) if feed.stream.kind == "depth" else img)
