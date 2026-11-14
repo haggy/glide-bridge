@@ -1,0 +1,13 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            // Writes .vscode/ros.env + .vscode/ros-python from env/activate_ros.sh.
+            "label": "glide_ros env",
+            "type": "shell",
+            "command": "${workspaceFolder}/env/vscode_env.sh",
+            "presentation": { "reveal": "silent", "panel": "shared" },
+            "problemMatcher": []
+        }
+    ]
+}
