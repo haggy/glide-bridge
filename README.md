@@ -139,6 +139,9 @@ Depth and IR follow the same pattern (`up_depth`, `down_ir`, ...; see
 `..._image_raw_rfps` lose the suffix); later the robot does. Needs ROS 2 Humble (the
 robot's distro) in a conda env:
 
+NOTE: You must have [Rust](https://rust-lang.org/tools/install/) installed. If not, wheels will fail to build.
+After install, make sure to source (or start a new terminal session) and verify with `rustc --version`
+
 ```bash
 conda env create -f env/ros_humble.yml        # once
 source env/activate_ros.sh && pip install -e . --no-deps   # once
