@@ -53,7 +53,7 @@ def mcap_files(path: str | Path) -> list[Path]:
     Parameters
     ----------
     path : str or Path
-        A bag folder (all its .mcap files, sorted) or a single .mcap file.
+        A bag folder (all its .mcap files, in split order) or a single .mcap file.
 
     Returns
     -------
@@ -63,9 +63,20 @@ def mcap_files(path: str | Path) -> list[Path]:
     ------
     FileNotFoundError
         If a folder contains no .mcap files.
+
+    Notes
+    -----
+    rosbag2 splits a long recording into ``<name>_0.mcap, <name>_1.mcap, ...``. Files
+    are ordered by that trailing number, so ``_10`` comes after ``_2`` (a plain name
+    sort would put it first); names without one sort by name, after numbered ones.
     """
     p = Path(path)
-    files = sorted(p.glob("*.mcap")) if p.is_dir() else [p]
+
+    def split_index(f: Path) -> tuple[int, str]:
+        stem, _, idx = f.stem.rpartition("_")
+        return (int(idx), stem) if stem and idx.isdigit() else (1 << 30, f.name)
+
+    files = sorted(p.glob("*.mcap"), key=split_index) if p.is_dir() else [p]
     if not files:
         raise FileNotFoundError(f"no .mcap files in {p}")
     return files

@@ -154,20 +154,20 @@ access with your own Google login):
 ```bash
 ./fetch_bags.sh setup        # once: sign in through the browser
 ./fetch_bags.sh list         # bags in the Drive folder
-./fetch_bags.sh pull         # download any you don't have yet into data/bags/
+./fetch_bags.sh pull         # download new ones into data/bags/<recording>/ (one folder per recording)
 ./fetch_bags.sh get <drive URL or file id>   # a specific file from anywhere in Drive
 ```
 
 Then:
 
 ```bash
-./demos/stream_demo.sh data/bags/<bag>.mcap   # replay + 2x2 window (see below)
-./demos/stream_demo.sh data/bags/<bag>.mcap --rate 6 --streams up_color down_color
+./demos/stream_demo.sh data/bags/<recording>   # replay + 2x2 window (see below)
+./demos/stream_demo.sh data/bags/<recording> --rate 6 --streams up_color down_color
 ./demos/stream_demo.sh                        # synthetic bag: up 6 fps, down 2 fps
 
 # or the two halves separately (two terminals, both: source env/activate_ros.sh)
-python -m glide_bridge.ros.replay data/bags/<bag>.mcap --list    # topics in the bag
-python -m glide_bridge.ros.replay data/bags/<bag>.mcap --loop    # recorded timing
+python -m glide_bridge.ros.replay data/bags/<recording> --list    # topics in the bag
+python -m glide_bridge.ros.replay data/bags/<recording> --loop    # recorded timing
 python -m glide_bridge.ros.viewer --plot data/plots/timing.png   # window + timing report
 ```
 

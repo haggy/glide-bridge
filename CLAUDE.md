@@ -53,9 +53,17 @@ telemetry data to a laptop and, via ROS 2, into the perception pipeline.
   being retired during 2026. If downloads start failing with auth/quota errors, the fix
   is the user's own client_id (https://rclone.org/drive/#making-your-own-client-id),
   then `rclone config update glide_gdrive client_id=... client_secret=...` + `setup`.
-- Known bag: `rosbag2_alpha_033_2026-11-12_20-39-49_0.mcap` (180 s indoor hallway,
-  640x360). All cameras recorded at ~1 fps (`*_rfps` topics), and the up (forward)
-  color camera dropped out (13 frames); the down camera has 172 frames.
+- Layout: `data/bags/<recording>/<recording>_N.mcap` (rosbag2 splits long recordings;
+  a bag is the folder). Pass the folder to the replay to play all parts in order, or one
+  file to play just that part. `fetch_bags.sh` files downloads this way.
+- Known bags (both 640x360, all cameras ~1 fps as `*_rfps` topics):
+  - `rosbag2_alpha_033_2026-11-12_20-39-49` (1 file, 180 s indoor hallway): the up
+    (forward) color camera dropped out (13 frames); the down camera has 172.
+  - `rosbag2_alpha_033_2026-11-12_21-10-16`: only `_1` kept (13.7 s, 13 frames/camera,
+    all cameras intact). `_0` was damaged (never finalized, mostly zero bytes) and was
+    deleted locally; the user is removing it from Drive and recording new bags.
+- Bags can come off the robot unfinalized. A file whose last 8 bytes aren't the MCAP
+  magic (`89 4d 43 41 50 30 0d 0a`) is incomplete; check before debugging the replay.
 
 ## ROS conventions
 

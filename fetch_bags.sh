@@ -4,6 +4,7 @@
 #   ./fetch_bags.sh setup                 # once: authorise rclone (opens a browser)
 #   ./fetch_bags.sh list                  # .mcap files in the Drive folder, with sizes
 #   ./fetch_bags.sh pull                  # every .mcap in the folder (skips ones you have)
+#                                         # -> data/bags/<recording>/<recording>_N.mcap
 #   ./fetch_bags.sh pull alpha_033_2026-11-12   # only names containing this text
 #   ./fetch_bags.sh get <drive URL or file id> ...   # specific files anywhere in Drive
 #
@@ -30,6 +31,32 @@ drive_id() {
     else
         die "not a Drive file id or URL: $s"
     fi
+}
+
+# rosbag2 splits a recording into <recording>_0.mcap, _1.mcap, ...; a bag is the
+# folder of those files. Keep that layout: data/bags/<recording>/<recording>_N.mcap,
+# so the replay plays all parts of a recording in order.
+recording_of() { local n="${1##*/}"; n="${n%.mcap}"; [[ "$n" =~ ^(.+)_[0-9]+$ ]] && n="${BASH_REMATCH[1]}"; echo "$n"; }
+
+# Move loose .mcap files (older flat layout, or fresh `get` downloads) into their folders.
+organize() {
+    local f rec
+    shopt -s nullglob
+    for f in "$DEST"/*.mcap "$DEST"/.incoming/*.mcap; do
+        rec="$(recording_of "$f")"
+        mkdir -p "$DEST/$rec"
+        mv -n "$f" "$DEST/$rec/" && echo "  $rec/$(basename "$f")"
+    done
+    shopt -u nullglob
+}
+
+show_bags() {
+    local d
+    for d in "$DEST"/*/; do
+        compgen -G "$d*.mcap" >/dev/null || continue
+        printf '%s  (%s, %s)\n' "${d%/}" "$(ls "$d"*.mcap | wc -l | tr -d ' ') file(s)" \
+            "$(du -sh "$d" | cut -f1)"
+    done
 }
 
 need_rclone() {
@@ -62,24 +89,31 @@ case "$cmd" in
     pull)
         need_rclone
         mkdir -p "$DEST"
-        filter=(--include "*.mcap")
-        [[ $# -gt 0 ]] && filter=(--include "*$1*.mcap")
-        # copy (not sync): never deletes local files; skips files already present.
-        rclone copy "${REMOTE}:" "$DEST" "${FOLDER_ARGS[@]}" "${filter[@]}" \
-            --progress --transfers 2
-        ls -lh "$DEST"/*.mcap 2>/dev/null || true
+        organize
+        pattern="*.mcap"
+        [[ $# -gt 0 ]] && pattern="*$1*.mcap"
+        # copyto per file into its recording folder. Never deletes local files; skips
+        # files already present with the same size and time.
+        rclone lsf "${REMOTE}:" "${FOLDER_ARGS[@]}" --files-only --include "$pattern" |
+        while IFS= read -r name; do
+            rclone copyto "${REMOTE}:$name" "$DEST/$(recording_of "$name")/$name" \
+                "${FOLDER_ARGS[@]}" --progress
+        done
+        show_bags
         ;;
     get)
         need_rclone
         [[ $# -gt 0 ]] || die "usage: ./fetch_bags.sh get <drive URL or file id> ..."
-        mkdir -p "$DEST"
+        mkdir -p "$DEST/.incoming"
         for arg in "$@"; do
-            rclone backend copyid "${REMOTE}:" "$(drive_id "$arg")" "$DEST/" --progress
+            rclone backend copyid "${REMOTE}:" "$(drive_id "$arg")" "$DEST/.incoming/" --progress
         done
-        ls -lh "$DEST"
+        organize
+        rmdir "$DEST/.incoming" 2>/dev/null || true
+        show_bags
         ;;
     help|-h|--help)
-        sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)
         die "unknown command '$cmd' (setup | list | pull | get | help)"
