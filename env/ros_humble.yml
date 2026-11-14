@@ -17,6 +17,11 @@ dependencies:
   # Humble's compiled packages are built against numpy 1.x; numpy 2 breaks their
   # C extensions. The pip pins below keep pip from upgrading it.
   - numpy<2
+  # OpenBLAS's default OpenMP build makes `import numpy` load conda's libomp; pip's
+  # torch brings its own OpenMP (libiomp5 on macOS), and two runtimes in one process
+  # segfault as soon as torch runs threaded code (e.g. `import cv2` before `import torch`).
+  # The pthreads build loads no OpenMP runtime.
+  - libopenblas=*=*pthreads*
   - matplotlib
   - pillow
   - pip

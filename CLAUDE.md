@@ -37,6 +37,11 @@ telemetry data to a laptop and, via ROS 2, into the perception pipeline.
 - `glide_ros` must keep **numpy < 2** (RoboStack Humble is built against 1.x). When
   adding pip packages there (e.g. ultralytics), pin `numpy<2` and any dep that would
   force numpy 2 (`opencv-python<4.12`); check with `pip install --dry-run` first.
+- `glide_ros` pins the **pthreads build of OpenBLAS** (`libopenblas=*=*pthreads*`). The
+  default OpenMP build loads conda's libomp with numpy, pip torch loads its own OpenMP,
+  and the two segfault together (it shows up as the viewer crashing once detection
+  runs). If a segfault appears with torch, check `OMP_NUM_THREADS=1` first: if that
+  fixes it, it's duplicate OpenMP runtimes again.
 - VS Code debugging of ROS code: `.vscode/launch.json` ("Camera window + bag replay")
   runs under `glide_ros` via `env/vscode_env.sh`, which exports the activated env to
   `.vscode/ros.env` + `.vscode/ros-python` (git-ignored, regenerated each launch).
