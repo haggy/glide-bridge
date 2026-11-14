@@ -2,12 +2,12 @@
 
 Messages are deserialized with ``rclpy.serialization`` into the real ``sensor_msgs``
 classes, so they can be republished unchanged, byte for byte, apart from the header
-fields the replay node chooses to overwrite.
+fields the replay node chooses to overwrite. File discovery and topic listing come
+from :mod:`glide_bridge.mcap_utils`.
 """
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -17,10 +17,15 @@ from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 from ..mcap_utils import list_topics, mcap_files
+from ..topics import CameraStream
 
 IMAGE_TYPES: frozenset[str] = frozenset({"sensor_msgs/msg/Image",
                                          "sensor_msgs/msg/CompressedImage"})
 CAMERA_INFO_TYPE: str = "sensor_msgs/msg/CameraInfo"
+
+# How a live topic can appear in a bag: as published, rate-reduced by the robot's
+# data-collection recorder (``_rfps``), or through the compressed image_transport.
+RECORDED_SUFFIXES: tuple[str, ...] = ("", "_rfps", "/compressed")
 
 
 @dataclass(frozen=True)
@@ -45,71 +50,53 @@ class BagMessage:
     msg: Any
 
 
-def image_topics(path: str | Path) -> dict[str, str]:
-    """Image topics in a bag, ``topic -> type``."""
-    return {t: ty for t, (ty, _) in list_topics(path).items() if ty in IMAGE_TYPES}
+@dataclass(frozen=True)
+class RecordedStream:
+    """Where one live camera stream is stored in a bag.
+
+    Attributes
+    ----------
+    stream : CameraStream
+        The live stream (its ``base_topic``/``info_topic`` are what gets published).
+    image_topic : str
+        Recorded image topic, e.g. ``/camera_up/color/image_raw_rfps``.
+    info_topic : str or None
+        Recorded CameraInfo topic, or None if the bag has none for this camera.
+    count : int
+        Number of recorded image messages.
+    """
+
+    stream: CameraStream
+    image_topic: str
+    info_topic: str | None
+    count: int
 
 
-def pick_camera_topic(path: str | Path, preferred: Sequence[str] = (
-        "/camera_up/color/image_raw_rfps", "/camera_up/color/image_raw",
-        "/camera_up/color/image_raw/compressed")) -> str:
-    """Choose the color camera topic to replay when none is given.
+def find_recorded(path: str | Path, stream: CameraStream) -> RecordedStream | None:
+    """Find a live camera stream's recorded topics in a bag.
 
     Parameters
     ----------
     path : str or Path
         Bag folder or ``.mcap`` file.
-    preferred : sequence of str, optional
-        Topics tried in order; the up camera faces forward at handle height.
+    stream : CameraStream
+        Live stream from :data:`glide_bridge.topics.PRESETS`.
 
     Returns
     -------
-    str
-        The first preferred topic present with at least half as many frames as the
-        busiest color topic; otherwise the busiest color topic (a warning is
-        printed); otherwise the busiest image topic.
-
-    Raises
-    ------
-    ValueError
-        If the bag holds no image topics.
-
-    Notes
-    -----
-    The frame-count check exists because a camera can drop out during a recording:
-    in ``rosbag2_alpha_033_2026-11-12_20-39-49`` the up color camera has 13 frames
-    against 172 for the down camera.
+    RecordedStream or None
+        None if no image topic in :data:`RECORDED_SUFFIXES` form is in the bag.
+        If several forms are present, the one with the most frames wins.
     """
-    counts = {t: n for t, (ty, n) in list_topics(path).items() if ty in IMAGE_TYPES}
-    if not counts:
-        raise ValueError(f"no image topics in {path}")
-    color = {t: n for t, n in counts.items() if "color" in t} or counts
-    busiest = max(sorted(color), key=lambda t: color[t])
-    for t in preferred:
-        if t in counts:
-            if counts[t] * 2 >= color[busiest]:
-                return t
-            print(f"warning: {t} has only {counts[t]} frames; replaying {busiest} "
-                  f"({color[busiest]} frames) instead. Pass --topic to override.",
-                  file=sys.stderr)
-            break
-    return busiest
-
-
-def info_topic_for(path: str | Path, image_topic: str) -> str | None:
-    """Find the ``CameraInfo`` topic that belongs to ``image_topic``, if recorded.
-
-    Notes
-    -----
-    Matches by camera prefix: ``/camera_up/color/image_raw_rfps`` pairs with a
-    ``CameraInfo`` topic under ``/camera_up/color/``.
-    """
-    prefix = image_topic.rsplit("/", 1)[0] + "/"
-    if prefix.endswith("/image_raw/"):          # .../image_raw/compressed
-        prefix = prefix[: -len("image_raw/")]
-    infos = sorted(t for t, (ty, _) in list_topics(path).items()
-                   if ty == CAMERA_INFO_TYPE and t.startswith(prefix))
-    return infos[0] if infos else None
+    topics = list_topics(path)
+    found = [(topics[t][1], t) for t in (stream.base_topic + s for s in RECORDED_SUFFIXES)
+             if t in topics and topics[t][0] in IMAGE_TYPES]
+    if not found:
+        return None
+    count, image_topic = max(found)
+    info = stream.info_topic
+    info_topic = info if info and topics.get(info, ("", 0))[0] == CAMERA_INFO_TYPE else None
+    return RecordedStream(stream, image_topic, info_topic, count)
 
 
 def iter_bag(path: str | Path, topics: Sequence[str]) -> Iterator[BagMessage]:

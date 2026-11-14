@@ -124,11 +124,20 @@ link.close()
 `subscribe()` options: `max_rate` (Hz cap applied on the robot), `lossless` (PNG
 color), `decode=False` (raw bytes via `add_listener`, as the recorder does).
 
-## ROS 2 camera stream (`/camera_raw`)
+## ROS 2 camera streams
 
-The perception pipeline consumes `sensor_msgs/Image` on `/camera_raw` (intrinsics on
-`/camera_raw/camera_info`). For now an MCAP replay feeds it; later the live Glide camera
-gets remapped to the same topic. Needs ROS 2 Humble (the robot's distro) in a conda env:
+Camera images travel on the **robot's own ROS 2 topics**, so the topic says which camera
+a frame came from and consumers work unchanged against the live Glide:
+
+| stream | camera | image (`sensor_msgs/Image`) | intrinsics (`CameraInfo`) |
+| --- | --- | --- | --- |
+| `up_color` | forward, handle height | `/camera_up/color/image_raw` | `/camera_up/color/camera_info` |
+| `down_color` | ground ahead of the wheels | `/camera_down/color/image_raw` | `/camera_down/color/camera_info` |
+
+Depth and IR follow the same pattern (`up_depth`, `down_ir`, ...; see
+`glide_bridge/topics.py`). For now an MCAP replay publishes them (bag topics such as
+`..._image_raw_rfps` lose the suffix); later the robot does. Needs ROS 2 Humble (the
+robot's distro) in a conda env:
 
 ```bash
 conda env create -f env/ros_humble.yml        # once
@@ -149,8 +158,9 @@ access with your own Google login):
 Then:
 
 ```bash
-./demos/stream_demo.sh data/bags/<bag>.mcap   # replay + live matplotlib window
-./demos/stream_demo.sh                        # same, on a synthetic 6 fps bag
+./demos/stream_demo.sh data/bags/<bag>.mcap   # replay + 2x2 window (see below)
+./demos/stream_demo.sh data/bags/<bag>.mcap --rate 6 --streams up_color down_color
+./demos/stream_demo.sh                        # synthetic bag: up 6 fps, down 2 fps
 
 # or the two halves separately (two terminals, both: source env/activate_ros.sh)
 python -m glide_bridge.ros.replay data/bags/<bag>.mcap --list    # topics in the bag
@@ -158,8 +168,12 @@ python -m glide_bridge.ros.replay data/bags/<bag>.mcap --loop    # recorded timi
 python -m glide_bridge.ros.viewer --plot data/plots/timing.png   # window + timing report
 ```
 
-The replay keeps the recorded frame timing (`--rate 2` for 2x, `--fps N` to force a
-rate) and stamps frames with the publish time, so the viewer can show latency.
+Both default to `--streams up_color down_color up_depth down_depth`, which the viewer
+lays out as a grid: a column per camera (forward/up left, down right) and a row per
+kind (color on top, depth below, with a colorbar in metres). Each stream keeps its own
+recorded timing (`--rate 2` plays at 2x), and the viewer updates each panel only when
+that camera delivers a frame, so cameras with different rates or dropouts preview
+independently. `--snapshot out.png` saves the window as it last looked. Frames are stamped with the publish time, so the viewer can show latency.
 `env/activate_ros.sh` uses Cyclone DDS like the robot and keeps traffic on localhost.
 
 ## Simulators
@@ -187,7 +201,7 @@ The Gazebo sim can also be read through rosbridge (`--backend rosbridge`,
 | `robot/run_relay.sh` | starts the relay with the robot service's DDS environment |
 | `glide_robot.sh` | laptop helper: deploy/start/stop relay, uploader, bags, info |
 | `fetch_bags.sh` | download bags from the project Google Drive (rclone) |
-| `glide_bridge/ros/` | ROS 2 nodes: MCAP replay to `/camera_raw`, matplotlib stream viewer |
+| `glide_bridge/ros/` | ROS 2 nodes: MCAP replay onto the robot's camera topics, matplotlib stream viewer |
 | `demos/` | runnable visual checks (`stream_demo.sh`, synthetic bag generator) |
 | `env/` | ROS 2 Humble conda env and activate script |
 | `record.py` | session recorder |

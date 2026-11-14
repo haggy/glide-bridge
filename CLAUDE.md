@@ -59,9 +59,15 @@ telemetry data to a laptop and, via ROS 2, into the perception pipeline.
 
 ## ROS conventions
 
-- Camera stream topic for the perception pipeline: `/camera_raw`
-  (`sensor_msgs/msg/Image`), with intrinsics on `/camera_raw/camera_info`. Sources
-  (MCAP replay now, live Glide later) publish there; consumers only subscribe there.
+- Camera topics are the **robot's own names** from `PRESETS["glide"]` in
+  `glide_bridge/topics.py`: e.g. `up_color` (forward camera) on
+  `/camera_up/color/image_raw` + `/camera_up/color/camera_info`, `down_color` on
+  `/camera_down/...`. The topic identifies the camera. Sources (MCAP replay now, live
+  Glide later) publish there, and consumers subscribe by stream name, so moving to the
+  robot needs no remapping. Bag topics like `..._rfps` are republished without the suffix.
+  (This replaced an earlier single `/camera_raw` topic.)
+- Streams are independent: different rates and dropouts per camera are normal; never
+  assume frames from two cameras arrive paired.
 - Sensor QoS: best effort, keep last, small depth, so slow consumers drop frames
   instead of queueing them.
 - Data files (`data/`, `*.mcap`) stay out of git.

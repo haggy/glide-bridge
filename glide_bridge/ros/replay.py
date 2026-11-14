@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
-"""Replay a Glide MCAP recording as a live ROS 2 camera stream on ``/camera_raw``.
+"""Replay Glide camera streams from an MCAP recording as live ROS 2 topics.
 
-Stands in for the robot's camera driver: frames come out on the same topic, with the
-same message type and the original timing, so downstream nodes can't tell a replay
-from a live stream. To switch to the real Glide later, remap its camera topic to
-``/camera_raw`` instead of running this node.
+Stands in for the robot's camera drivers: each stream comes out on the robot's own
+topic (``/camera_up/color/image_raw``, ``/camera_down/color/image_raw``, ...) with the
+same message type and the recorded timing, so downstream nodes can't tell a replay
+from the live Glide. Streams are independent: a camera with fewer frames simply
+publishes less often.
 
 Examples
 --------
 ::
 
     source env/activate_ros.sh
-    python -m glide_bridge.ros.replay data/bags/rosbag2_alpha_033_....mcap --list
-    python -m glide_bridge.ros.replay data/bags/bag.mcap                 # real time, once
-    python -m glide_bridge.ros.replay data/bags/bag.mcap --loop --rate 2 # 2x, forever
-    python -m glide_bridge.ros.replay data/bags/bag.mcap --fps 15        # fixed rate
-    python -m glide_bridge.ros.replay bag.mcap --topic /camera_down/color/image_raw_rfps
-    # standard ROS remapping also works:
-    python -m glide_bridge.ros.replay bag.mcap --ros-args -r /camera_raw:=/camera_up_raw
+    python -m glide_bridge.ros.replay data/bags/bag.mcap --list     # what the bag holds
+    python -m glide_bridge.ros.replay data/bags/bag.mcap            # up + down color
+    python -m glide_bridge.ros.replay data/bags/bag.mcap --loop --rate 6
+    python -m glide_bridge.ros.replay data/bags/bag.mcap --streams up_color up_depth
 
-Published
----------
-``/camera_raw`` : sensor_msgs/msg/Image
-    Raw images pass through untouched (encoding as recorded). CompressedImage topics
-    are decoded to ``rgb8``.
-``/camera_raw/camera_info`` : sensor_msgs/msg/CameraInfo
-    The latest recorded intrinsics, re-sent with every frame and the same stamp, if
-    the bag has a CameraInfo topic for that camera.
+Published (per stream, names from ``glide_bridge.topics.PRESETS["glide"]``)
+-------------------------------------------------------------------------
+``<stream base_topic>`` : sensor_msgs/msg/Image
+    e.g. ``/camera_up/color/image_raw``. Recorded ``..._rfps`` topics lose the suffix.
+    Raw images pass through untouched (encoding as recorded); CompressedImage
+    recordings are decoded to ``rgb8``.
+``<stream info_topic>`` : sensor_msgs/msg/CameraInfo
+    e.g. ``/camera_up/color/camera_info``: the latest recorded intrinsics, re-sent with
+    every frame of that stream and the same stamp, if the bag has them.
 """
 
 from __future__ import annotations
@@ -39,113 +38,116 @@ from typing import Sequence
 
 import rclpy
 from rclpy.node import Node
+from rclpy.publisher import Publisher
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 
 from ..mcap_utils import list_topics
-from . import CAMERA_INFO_TOPIC, CAMERA_TOPIC
-from .image_msgs import compressed_to_image, stamp_to_sec
-from .mcap_source import iter_bag, info_topic_for, pick_camera_topic
+from . import DEFAULT_STREAMS, GLIDE_STREAMS
+from .image_msgs import compressed_to_image
+from .mcap_source import RecordedStream, find_recorded, iter_bag
 
 
 class McapCameraReplay(Node):
-    """Publish one camera topic from a bag on ``/camera_raw`` with recorded timing.
+    """Publish recorded camera streams on the robot's topics with recorded timing.
 
     Parameters
     ----------
     bag : Path
         Bag folder or ``.mcap`` file.
-    image_topic : str
-        Recorded Image or CompressedImage topic to replay.
-    info_topic : str or None
-        Recorded CameraInfo topic for the same camera, or None to skip intrinsics.
+    streams : list of RecordedStream
+        Streams to replay, from :func:`~glide_bridge.ros.mcap_source.find_recorded`.
     rate : float
-        Playback speed multiplier; 1.0 is real time. Ignored when ``fps`` is set.
-    fps : float or None
-        Publish at a fixed rate instead of the recorded timing.
+        Playback speed multiplier; 1.0 is real time.
     restamp : bool
         Overwrite ``header.stamp`` with the publish time, as a live driver would.
         Needed for consumers to measure latency; turn off to keep sensor stamps.
-    out_topic : str
-        Output image topic. Intrinsics go to ``out_topic + "/camera_info"``.
 
     Notes
     -----
-    Frame ``k`` (recorded at sensor time :math:`t_k`) is published at wall time
+    All streams share one clock. A message logged at bag time :math:`t_k` (ns, any
+    stream) is published at wall time
 
     .. math:: w_k = w_0 + (t_k - t_0) / \\text{rate}
 
-    or :math:`w_k = w_0 + k / \\text{fps}` with ``--fps``. If decoding falls behind,
-    frames go out immediately and the lag :math:`\\max(0, w_{now} - w_k)` is logged;
-    no frames are skipped.
+    where :math:`t_0` is the first logged image. Messages are read in log order, so
+    the cameras interleave exactly as recorded. If decoding falls behind, messages go
+    out immediately and the lag :math:`\\max(0, w_{now} - w_k)` is logged; nothing is
+    skipped.
     """
 
-    def __init__(self, bag: Path, image_topic: str, info_topic: str | None,
-                 rate: float = 1.0, fps: float | None = None, restamp: bool = True,
-                 out_topic: str = CAMERA_TOPIC) -> None:
+    def __init__(self, bag: Path, streams: list[RecordedStream], rate: float = 1.0,
+                 restamp: bool = True) -> None:
         super().__init__("mcap_camera_replay")
-        self.bag, self.image_topic, self.info_topic = bag, image_topic, info_topic
-        self.rate, self.fps, self.restamp = rate, fps, restamp
-        self.image_pub = self.create_publisher(Image, out_topic, qos_profile_sensor_data)
-        info_out = (CAMERA_INFO_TOPIC if out_topic == CAMERA_TOPIC
-                    else out_topic.rstrip("/") + "/camera_info")
-        self.info_pub = self.create_publisher(CameraInfo, info_out, qos_profile_sensor_data)
-        self.published = 0
+        self.bag, self.streams, self.rate, self.restamp = bag, streams, rate, restamp
+        # recorded topic -> (stream, image publisher, info publisher or None)
+        self.routes: dict[str, tuple[RecordedStream, Publisher, Publisher | None]] = {}
+        self.info_of: dict[str, RecordedStream] = {}      # recorded info topic -> stream
+        for rs in streams:
+            image_pub = self.create_publisher(Image, rs.stream.base_topic,
+                                              qos_profile_sensor_data)
+            info_pub = None
+            if rs.info_topic:
+                info_pub = self.create_publisher(CameraInfo, rs.stream.info_topic,
+                                                 qos_profile_sensor_data)
+                self.info_of[rs.info_topic] = rs
+            self.routes[rs.image_topic] = (rs, image_pub, info_pub)
+            self.get_logger().info(
+                f"{rs.stream.name}: {rs.image_topic} ({rs.count} frames) -> "
+                f"{rs.stream.base_topic}"
+                + (f" + {rs.stream.info_topic}" if info_pub else " (no CameraInfo)"))
+        self.published: dict[str, int] = {rs.stream.name: 0 for rs in streams}
         self.max_lag_s = 0.0
-        self.get_logger().info(
-            f"{bag.name}: {image_topic} -> {self.image_pub.topic_name}"
-            + (f", {info_topic} -> {self.info_pub.topic_name}" if info_topic else
-               " (no CameraInfo in bag)")
-            + (f" at {fps} fps" if fps else f" at {rate}x real time"))
+        self.get_logger().info(f"{bag.name} at {rate}x real time")
 
     def play_once(self) -> int:
-        """Publish every frame in the bag once.
+        """Publish every recorded frame of every stream once.
 
         Returns
         -------
         int
-            Frames published in this pass (stops early if ROS shuts down).
+            Image messages published in this pass (stops early on ROS shutdown).
         """
-        topics = [self.image_topic] + ([self.info_topic] if self.info_topic else [])
-        info: CameraInfo | None = None
-        t0_bag: float | None = None
+        topics = list(self.routes) + list(self.info_of)
+        latest_info: dict[str, CameraInfo] = {}           # stream name -> intrinsics
+        t0_ns: int | None = None
         w0 = time.monotonic()
-        k = 0
         last_log = w0
+        n = 0
         for bm in iter_bag(self.bag, topics):
             if not rclpy.ok():
                 break
-            if bm.topic == self.info_topic:
-                info = bm.msg
+            if bm.topic in self.info_of:
+                latest_info[self.info_of[bm.topic].stream.name] = bm.msg
                 continue
-            img: Image = (compressed_to_image(bm.msg) if isinstance(bm.msg, CompressedImage)
-                          else bm.msg)
-            t_bag = stamp_to_sec(img.header.stamp) or bm.log_time_ns * 1e-9
-            if t0_bag is None:
-                t0_bag = t_bag
-            target = w0 + (k / self.fps if self.fps else (t_bag - t0_bag) / self.rate)
-            delay = target - time.monotonic()
+            rs, image_pub, info_pub = self.routes[bm.topic]
+            if t0_ns is None:
+                t0_ns = bm.log_time_ns
+            delay = w0 + (bm.log_time_ns - t0_ns) * 1e-9 / self.rate - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
             else:
                 self.max_lag_s = max(self.max_lag_s, -delay)
 
+            img: Image = (compressed_to_image(bm.msg) if isinstance(bm.msg, CompressedImage)
+                          else bm.msg)
             if self.restamp:
                 img.header.stamp = self.get_clock().now().to_msg()
-            if info is not None:
+            info = latest_info.get(rs.stream.name)
+            if info_pub is not None and info is not None:
                 info.header.stamp = img.header.stamp
-                self.info_pub.publish(info)
-            self.image_pub.publish(img)
-            k += 1
-            self.published += 1
+                info_pub.publish(info)
+            image_pub.publish(img)
+            self.published[rs.stream.name] += 1
+            n += 1
 
             now = time.monotonic()
             if now - last_log >= 5.0:
-                self.get_logger().info(
-                    f"{k} frames, {k / (now - w0):.1f} fps, "
-                    f"{img.width}x{img.height} {img.encoding}, max lag {self.max_lag_s * 1e3:.0f} ms")
+                counts = ", ".join(f"{k} {v}" for k, v in self.published.items())
+                self.get_logger().info(f"published {counts}; max lag "
+                                       f"{self.max_lag_s * 1e3:.0f} ms")
                 last_log = now
-        return k
+        return n
 
 
 def parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str]]:
@@ -153,10 +155,11 @@ def parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                 epilog="Run with --list first to see the bag's topics.")
     p.add_argument("bag", type=Path, help="bag folder or .mcap file")
-    p.add_argument("--topic", help="recorded image topic (default: the up color camera)")
-    p.add_argument("--out", default=CAMERA_TOPIC, help=f"output topic (default: {CAMERA_TOPIC})")
+    p.add_argument("--streams", nargs="+", default=DEFAULT_STREAMS,
+                   choices=sorted(GLIDE_STREAMS), metavar="STREAM",
+                   help=f"streams to replay (default: {' '.join(DEFAULT_STREAMS)}); "
+                        f"choices: {', '.join(sorted(GLIDE_STREAMS))}")
     p.add_argument("--rate", type=float, default=1.0, help="playback speed, 1 = real time")
-    p.add_argument("--fps", type=float, help="fixed publish rate instead of recorded timing")
     p.add_argument("--loop", action="store_true", help="replay forever")
     p.add_argument("--keep-stamps", action="store_true",
                    help="publish recorded sensor stamps instead of the publish time")
@@ -171,13 +174,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         for t, (ty, n) in sorted(list_topics(args.bag).items()):
             print(f"{n:8d}  {ty:35s}  {t}")
         return 0
-    image_topic = args.topic or pick_camera_topic(args.bag)
-    info_topic = info_topic_for(args.bag, image_topic)
+    streams: list[RecordedStream] = []
+    for name in args.streams:
+        rs = find_recorded(args.bag, GLIDE_STREAMS[name])
+        if rs is None:
+            print(f"warning: no recording of {name} ({GLIDE_STREAMS[name].base_topic}) "
+                  f"in {args.bag.name}; skipping", file=sys.stderr)
+        else:
+            streams.append(rs)
+    if not streams:
+        print("nothing to replay; run with --list to see the bag's topics", file=sys.stderr)
+        return 1
 
     rclpy.init(args=["replay", *ros_args])
-    node = McapCameraReplay(args.bag, image_topic, info_topic, args.rate, args.fps,
-                            restamp=not args.keep_stamps, out_topic=args.out)
-    # Give subscribers a moment to discover the publisher so frame 0 isn't lost.
+    node = McapCameraReplay(args.bag, streams, args.rate, restamp=not args.keep_stamps)
+    # Give subscribers a moment to discover the publishers so frame 0 isn't lost.
     time.sleep(0.5)
     try:
         passes = 0
@@ -196,7 +207,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise
     finally:
         # print, not the ROS logger: the context may already be shut down here.
-        print(f"published {node.published} frames, max lag {node.max_lag_s * 1e3:.0f} ms")
+        counts = ", ".join(f"{k} {v}" for k, v in node.published.items())
+        print(f"published {counts}; max lag {node.max_lag_s * 1e3:.0f} ms")
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
