@@ -36,4 +36,4 @@ VIEWER_ARGS=()
 python -m glide_bridge.ros.replay "$BAG" --loop "$@" &
 REPLAY=$!
 trap 'kill $REPLAY 2>/dev/null; wait $REPLAY 2>/dev/null' EXIT
-python -m glide_bridge.ros.viewer --plot data/plots/stream_timing.png "${VIEWER_ARGS[@]}"
+python -m glide_bridge.ros.viewer --plot data/plots/stream_timing.png ${VIEWER_ARGS[@]+"${VIEWER_ARGS[@]}"}
