@@ -1,0 +1,58 @@
+{
+    // ROS configs run in the glide_ros conda env: the "glide_ros env" task exports it to
+    // .vscode/ros.env and links its interpreter as .vscode/ros-python (env/vscode_env.sh).
+    // To debug object detection, set breakpoints in src/img_processing/obj_detection.py
+    // and start "Camera window + bag replay". apply_bounding_boxes runs on the viewer's
+    // ROS executor thread, once per color frame of each camera.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Camera window (viewer)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "glide_bridge.ros.viewer",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.vscode/ros-python",
+            "envFile": "${workspaceFolder}/.vscode/ros.env",
+            "preLaunchTask": "glide_ros env",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Bag replay",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "glide_bridge.ros.replay",
+            "args": ["${input:bag}", "--loop", "--rate", "${input:rate}"],
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.vscode/ros-python",
+            "envFile": "${workspaceFolder}/.vscode/ros.env",
+            "preLaunchTask": "glide_ros env",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ],
+    "compounds": [
+        {
+            // Same as ./demos/stream_demo.sh, under the debugger. Stopping either stops both.
+            "name": "Camera window + bag replay",
+            "configurations": ["Bag replay", "Camera window (viewer)"],
+            "stopAll": true
+        }
+    ],
+    "inputs": [
+        {
+            "id": "bag",
+            "type": "promptString",
+            "description": "Bag folder or .mcap file to replay",
+            "default": "data/bags/rosbag2_alpha_033_2026-11-12_21-10-16"
+        },
+        {
+            "id": "rate",
+            "type": "promptString",
+            "description": "Playback rate (x real time; the bags are ~1 fps, so 6 gives ~6 fps)",
+            "default": "6"
+        }
+    ]
+}

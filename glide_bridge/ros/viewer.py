@@ -2,8 +2,10 @@
 """Live matplotlib "video" of Glide camera topics, plus a timing report when it closes.
 
 One panel per stream, laid out with a column per camera (forward/up, down) and a
-row per image kind (color on top, depth below). Each panel updates independently
-whenever its own topic delivers a frame. This
+row per image kind (color on top, depth below). A third row shows each color frame
+after :meth:`src.img_processing.obj_detection.ObjectDetection.apply_bounding_boxes`,
+which runs on every received color frame of both cameras. Each panel updates
+independently whenever its own topic delivers a frame. This
 is the consumer end of the pipeline and the visual check for it: if each panel shows
 frames in order at its camera's rate with low latency, the pub/sub path works.
 
@@ -16,6 +18,7 @@ Examples
     python -m glide_bridge.ros.viewer --streams up_color down_color   # color only
     python -m glide_bridge.ros.viewer --duration 30 --plot data/plots/timing.png
     python -m glide_bridge.ros.viewer --headless --duration 20 --plot timing.png
+    python -m glide_bridge.ros.viewer --no-detections     # skip the detection row
 
 Close the window (or Ctrl-C) to stop. With ``--plot`` a figure is saved showing, per
 stream, the inter-arrival interval, the latency, an interval histogram, and a few
@@ -38,7 +41,28 @@ from ..topics import CameraStream
 from . import DEFAULT_STREAMS, GLIDE_STREAMS
 
 CAMERA_LABELS: dict[str, str] = {"up": "forward (up)", "down": "downward"}
-KIND_ROWS: tuple[str, ...] = ("color", "depth", "mono", "labels")   # top to bottom
+# Top to bottom. "detections" is derived in the viewer, not a robot topic.
+KIND_ROWS: tuple[str, ...] = ("color", "depth", "detections", "mono", "labels")
+
+
+def detection_stream(source: CameraStream) -> CameraStream:
+    """Pseudo-stream for the detector output on a color stream.
+
+    Parameters
+    ----------
+    source : CameraStream
+        A color stream, e.g. ``up_color``.
+
+    Returns
+    -------
+    CameraStream
+        Named ``<camera>_detections`` with kind ``"detections"``, so
+        :func:`grid_layout` puts it in the source camera's column, below depth.
+        ``base_topic`` is the source topic (the frames it was computed from); nothing
+        is published there.
+    """
+    cam = source.name.partition("_")[0]
+    return CameraStream(f"{cam}_detections", source.base_topic, "detections")
 
 
 def panel_label(stream: CameraStream) -> str:
@@ -303,6 +327,8 @@ def parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str
                    help="no window; just collect stats (use with --plot)")
     p.add_argument("--thumbs", type=int, default=6, help="frames per stream in the report")
     p.add_argument("--depth-max", type=float, default=5.0, help="depth colour range, m")
+    p.add_argument("--no-detections", action="store_true",
+                   help="don't run ObjectDetection on color frames (no detection row)")
     return p.parse_known_args(argv)
 
 
@@ -321,17 +347,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from .image_msgs import image_to_numpy, stamp_to_sec
 
-    monitors = [StreamMonitor(GLIDE_STREAMS[name], args.thumbs)
-                for name in dict.fromkeys(args.streams)]
+    sources = [StreamMonitor(GLIDE_STREAMS[name], args.thumbs)
+               for name in dict.fromkeys(args.streams)]
+    # Color stream name -> monitor of its detector output (third row).
+    detections: dict[str, StreamMonitor] = {}
+    detector = None
+    if not args.no_detections:
+        from src.img_processing.obj_detection import ObjectDetection
+        detector = ObjectDetection()
+        detections = {m.stream.name: StreamMonitor(detection_stream(m.stream), args.thumbs)
+                      for m in sources if m.stream.kind == "color"}
+    monitors = sources + list(detections.values())
 
     rclpy.init(args=["viewer", *ros_args])
     node = Node("camera_stream_viewer")
-    for m in monitors:
-        def on_image(msg: Image, m: StreamMonitor = m) -> None:
-            m.add(image_to_numpy(msg), msg.encoding, stamp_to_sec(msg.header.stamp))
+    for m in sources:
+        det = detections.get(m.stream.name)
+
+        def on_image(msg: Image, m: StreamMonitor = m, det: StreamMonitor | None = det) -> None:
+            img: np.ndarray = image_to_numpy(msg)        # (H, W, 3) uint8 RGB for color
+            stamp = stamp_to_sec(msg.header.stamp)
+            m.add(img, msg.encoding, stamp)
+            if det is not None:
+                # Copy so a detector that draws in place can't alter the color panel.
+                # The detection panel's latency includes the detector's run time.
+                boxed: np.ndarray = detector.apply_bounding_boxes(img.copy())
+                det.add(boxed, "rgb8", stamp)
         node.create_subscription(Image, m.stream.base_topic, on_image,
                                  qos_profile_sensor_data)
-        node.get_logger().info(f"{m.stream.name}: subscribed to {m.stream.base_topic}")
+        node.get_logger().info(f"{m.stream.name}: subscribed to {m.stream.base_topic}"
+                               + (f" (+ {det.stream.name})" if det else ""))
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     threading.Thread(target=executor.spin, daemon=True).start()

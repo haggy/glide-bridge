@@ -1,6 +1,9 @@
 # ROS 2 Humble (same distro as the Glide robot) via RoboStack, no sudo needed.
 #   conda env create -f env/ros_humble.yml
 #   conda activate glide_ros && pip install -e . --no-deps
+# Update an existing env (run from a shell where glide_ros is NOT active; with it
+# active, conda's own Python 3.14 picks up this env's packages and crashes):
+#   conda env update -n glide_ros -f env/ros_humble.yml
 name: glide_ros
 channels:
   - robostack-humble
@@ -11,7 +14,9 @@ dependencies:
   - ros-humble-rmw-cyclonedds-cpp
   - ros-humble-rosbag2-storage-mcap
   - ros-humble-ros2bag
-  - numpy
+  # Humble's compiled packages are built against numpy 1.x; numpy 2 breaks their
+  # C extensions. The pip pins below keep pip from upgrading it.
+  - numpy<2
   - matplotlib
   - pillow
   - pip
@@ -19,3 +24,9 @@ dependencies:
       - mcap>=1.6.0
       - mcap-ros2-support>=0.6.0
       - roslibpy>=1.7          # glide_bridge/__init__ imports the rosbridge client
+      # YOLO for src/img_processing. Pulls torch (CUDA build on Linux, a few GB; for
+      # CPU only, first: pip install torch torchvision --index-url
+      # https://download.pytorch.org/whl/cpu).
+      - ultralytics>=8.3
+      - numpy<2                # don't let ultralytics' deps upgrade numpy
+      - opencv-python<4.12     # 4.12+ requires numpy 2
