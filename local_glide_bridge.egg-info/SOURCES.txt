@@ -4,7 +4,7 @@ glide_bridge/__init__.py
 glide_bridge/client.py
 glide_bridge/decode.py
 glide_bridge/link.py
-glide_bridge/mcap.py
+glide_bridge/mcap_utils.py
 glide_bridge/topics.py
 local_glide_bridge.egg-info/PKG-INFO
 local_glide_bridge.egg-info/SOURCES.txt

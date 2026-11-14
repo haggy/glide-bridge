@@ -20,6 +20,23 @@ from .topics import CameraStream
 
 @dataclass
 class Frame:
+    """One decoded message.
+
+    Attributes
+    ----------
+    image : np.ndarray or dict
+        (H, W, 3) uint8 RGB, (H, W) uint8 mono/labels, (H, W) float32 depth in
+        metres (0 = no reading), or a dict for JSON topics (glide_link only).
+    encoding : str
+        Source encoding or wire encoding.
+    stamp : float
+        ROS header time, seconds.
+    received : float
+        Local ``time.time()`` when decoded.
+    header : dict or None
+        glide_link message header (topic, seq, enc, ...).
+    """
+
     image: np.ndarray
     encoding: str
     stamp: float            # ROS header time, seconds
@@ -30,7 +47,7 @@ class Frame:
 @dataclass
 class _FeedState:
     latest: Frame | None = None
-    arrivals: deque = field(default_factory=lambda: deque(maxlen=30))
+    arrivals: deque[float] = field(default_factory=lambda: deque(maxlen=30))
     errors: int = 0
     last_error: str = ""
 
@@ -39,7 +56,7 @@ class CameraFeed:
     """One camera topic. ``latest()`` returns the newest decoded frame or None."""
 
     def __init__(self, ros: roslibpy.Ros, stream: CameraStream,
-                 transport: str = "compressed", max_rate_hz: float = 15.0):
+                 transport: str = "compressed", max_rate_hz: float = 15.0) -> None:
         self.stream = stream
         self.transport = transport
         self.topic_name, self.msg_type = stream.topic(transport)
@@ -73,6 +90,12 @@ class CameraFeed:
             return self._state.latest
 
     def fps(self) -> float:
+        """Arrival rate over the last 30 frames (Hz); 0 if nothing for 2 s.
+
+        Notes
+        -----
+        ``fps = (N - 1) / (t_N - t_1)`` over the N most recent arrival times.
+        """
         with self._lock:
             t = list(self._state.arrivals)
         if len(t) < 2 or time.time() - t[-1] > 2.0:
@@ -80,6 +103,7 @@ class CameraFeed:
         return (len(t) - 1) / (t[-1] - t[0])
 
     def error(self) -> tuple[int, str]:
+        """(number of decode errors, last error message)."""
         with self._lock:
             return self._state.errors, self._state.last_error
 
@@ -91,7 +115,7 @@ class GlideBridge:
     """Connection to a rosbridge server plus any number of camera feeds."""
 
     def __init__(self, host: str = "localhost", port: int = 9090,
-                 timeout: float = 10.0):
+                 timeout: float = 10.0) -> None:
         self.ros = roslibpy.Ros(host=host, port=port)
         self.ros.run(timeout=timeout)   # starts the client in a background thread
         self.feeds: dict[str, CameraFeed] = {}

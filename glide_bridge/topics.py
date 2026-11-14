@@ -7,13 +7,38 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CameraStream:
+    """A camera topic and how to show it.
+
+    Attributes
+    ----------
+    name : str
+        Short stream name used on the command line (e.g. ``up_color``).
+    base_topic : str
+        Raw ``sensor_msgs/Image`` topic.
+    kind : str
+        ``"color"``, ``"depth"``, ``"mono"`` or ``"labels"``.
+    info_topic : str or None
+        ``sensor_msgs/CameraInfo`` topic with the intrinsics.
+    """
+
     name: str
     base_topic: str          # raw sensor_msgs/Image topic
     kind: str                # "color", "depth", "mono" or "labels"
     info_topic: str | None = None   # sensor_msgs/CameraInfo for intrinsics
 
     def topic(self, transport: str) -> tuple[str, str]:
-        """(topic, message type) for transport "raw" or "compressed"."""
+        """Topic and message type for an image_transport transport.
+
+        Parameters
+        ----------
+        transport : str
+            ``"raw"`` or ``"compressed"`` (depth uses ``compressedDepth``).
+
+        Returns
+        -------
+        tuple[str, str]
+            (topic name, rosbridge message type).
+        """
         if transport == "raw":
             return self.base_topic, "sensor_msgs/Image"
         suffix = "compressedDepth" if self.kind == "depth" else "compressed"

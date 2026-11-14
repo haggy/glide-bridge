@@ -1,0 +1,21 @@
+# ROS 2 Humble (same distro as the Glide robot) via RoboStack, no sudo needed.
+#   conda env create -f env/ros_humble.yml
+#   conda activate glide_ros && pip install -e . --no-deps
+name: glide_ros
+channels:
+  - robostack-humble
+  - conda-forge
+dependencies:
+  - python=3.11
+  - ros-humble-ros-base
+  - ros-humble-rmw-cyclonedds-cpp
+  - ros-humble-rosbag2-storage-mcap
+  - ros-humble-ros2bag
+  - numpy
+  - matplotlib
+  - pillow
+  - pip
+  - pip:
+      - mcap>=1.6.0
+      - mcap-ros2-support>=0.6.0
+      - roslibpy>=1.7          # glide_bridge/__init__ imports the rosbridge client

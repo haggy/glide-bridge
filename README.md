@@ -124,6 +124,44 @@ link.close()
 `subscribe()` options: `max_rate` (Hz cap applied on the robot), `lossless` (PNG
 color), `decode=False` (raw bytes via `add_listener`, as the recorder does).
 
+## ROS 2 camera stream (`/camera_raw`)
+
+The perception pipeline consumes `sensor_msgs/Image` on `/camera_raw` (intrinsics on
+`/camera_raw/camera_info`). For now an MCAP replay feeds it; later the live Glide camera
+gets remapped to the same topic. Needs ROS 2 Humble (the robot's distro) in a conda env:
+
+```bash
+conda env create -f env/ros_humble.yml        # once
+source env/activate_ros.sh && pip install -e . --no-deps   # once
+```
+
+Get bags from the project's Google Drive "Data" folder with `fetch_bags.sh` (uses
+[rclone](https://rclone.org), installed as a single binary in `~/.local/bin`; read-only
+access with your own Google login):
+
+```bash
+./fetch_bags.sh setup        # once: sign in through the browser
+./fetch_bags.sh list         # bags in the Drive folder
+./fetch_bags.sh pull         # download any you don't have yet into data/bags/
+./fetch_bags.sh get <drive URL or file id>   # a specific file from anywhere in Drive
+```
+
+Then:
+
+```bash
+./demos/stream_demo.sh data/bags/<bag>.mcap   # replay + live matplotlib window
+./demos/stream_demo.sh                        # same, on a synthetic 6 fps bag
+
+# or the two halves separately (two terminals, both: source env/activate_ros.sh)
+python -m glide_bridge.ros.replay data/bags/<bag>.mcap --list    # topics in the bag
+python -m glide_bridge.ros.replay data/bags/<bag>.mcap --loop    # recorded timing
+python -m glide_bridge.ros.viewer --plot data/plots/timing.png   # window + timing report
+```
+
+The replay keeps the recorded frame timing (`--rate 2` for 2x, `--fps N` to force a
+rate) and stamps frames with the publish time, so the viewer can show latency.
+`env/activate_ros.sh` uses Cyclone DDS like the robot and keeps traffic on localhost.
+
 ## Simulators
 
 The relay runs anywhere ROS 2 does. For the old Gazebo test sim in `../Glide`
@@ -148,6 +186,10 @@ The Gazebo sim can also be read through rosbridge (`--backend rosbridge`,
 | `robot/glide_link_relay.py` | relay: ROS 2 topics -> TCP, encodes images, serves many clients |
 | `robot/run_relay.sh` | starts the relay with the robot service's DDS environment |
 | `glide_robot.sh` | laptop helper: deploy/start/stop relay, uploader, bags, info |
+| `fetch_bags.sh` | download bags from the project Google Drive (rclone) |
+| `glide_bridge/ros/` | ROS 2 nodes: MCAP replay to `/camera_raw`, matplotlib stream viewer |
+| `demos/` | runnable visual checks (`stream_demo.sh`, synthetic bag generator) |
+| `env/` | ROS 2 Humble conda env and activate script |
 | `record.py` | session recorder |
 | `view_cameras.py` | live matplotlib viewer |
 | `glide_bridge/link.py` | `GlideLink` client, `TopicFeed` |

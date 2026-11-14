@@ -28,7 +28,7 @@ import csv
 import io
 import sys
 from pathlib import Path
-from typing import Iterator, Sequence
+from typing import IO, Any, Iterator, Sequence
 
 import numpy as np
 from PIL import Image
@@ -38,7 +38,7 @@ from mcap_ros2.decoder import DecoderFactory
 IMAGE_TYPES = {"sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}
 
 # encoding -> (numpy dtype, channels)
-_ENCODINGS = {
+_ENCODINGS: dict[str, tuple[type[np.generic], int]] = {
     "rgb8": (np.uint8, 3), "bgr8": (np.uint8, 3),
     "rgba8": (np.uint8, 4), "bgra8": (np.uint8, 4),
     "mono8": (np.uint8, 1), "8UC1": (np.uint8, 1), "8UC3": (np.uint8, 3),
@@ -48,7 +48,22 @@ _ENCODINGS = {
 
 
 def mcap_files(path: str | Path) -> list[Path]:
-    """A bag folder (all its .mcap files, in order) or a single .mcap file."""
+    """MCAP files of a bag.
+
+    Parameters
+    ----------
+    path : str or Path
+        A bag folder (all its .mcap files, sorted) or a single .mcap file.
+
+    Returns
+    -------
+    list[Path]
+
+    Raises
+    ------
+    FileNotFoundError
+        If a folder contains no .mcap files.
+    """
     p = Path(path)
     files = sorted(p.glob("*.mcap")) if p.is_dir() else [p]
     if not files:
@@ -56,11 +71,31 @@ def mcap_files(path: str | Path) -> list[Path]:
     return files
 
 
-def image_to_numpy(msg, to_rgb: bool = True) -> np.ndarray:
-    """Decode a sensor_msgs/Image or CompressedImage into a numpy array.
+def image_to_numpy(msg: Any, to_rgb: bool = True) -> np.ndarray:
+    """Decode a ``sensor_msgs/Image`` or ``CompressedImage`` into a numpy array.
 
-    Color comes back as HxWx3 uint8 RGB (BGR is converted unless to_rgb=False),
-    depth as HxW uint16 in millimetres (0 = no reading), IR/labels as HxW uint8.
+    Parameters
+    ----------
+    msg : decoded mcap_ros2 message
+        Image or CompressedImage (has ``format``).
+    to_rgb : bool
+        Convert bgr8/bgra8 to RGB(A) channel order.
+
+    Returns
+    -------
+    np.ndarray
+        (H, W, 3) uint8 RGB color, (H, W) uint16 depth in millimetres
+        (0 = no reading), or (H, W) uint8 IR/labels. Native byte order, writable.
+
+    Raises
+    ------
+    ValueError
+        If a raw image's encoding is not supported.
+
+    Notes
+    -----
+    Rows may be padded: each row is ``msg.step`` bytes, of which only
+    ``width * channels * itemsize`` hold pixels.
     """
     if hasattr(msg, "format"):  # CompressedImage
         img = Image.open(io.BytesIO(bytes(msg.data)))
@@ -72,10 +107,10 @@ def image_to_numpy(msg, to_rgb: bool = True) -> np.ndarray:
     dtype, ch = _ENCODINGS[enc]
     dt = np.dtype(dtype).newbyteorder(">" if msg.is_bigendian else "<")
     itemsize = dt.itemsize
-    buf = np.frombuffer(bytes(msg.data), dtype=dt)
+    buf: np.ndarray = np.frombuffer(bytes(msg.data), dtype=dt)
     # Rows may be padded: honour msg.step (bytes per row).
-    row = buf.reshape(msg.height, msg.step // itemsize)[:, : msg.width * ch]
-    arr = row.reshape(msg.height, msg.width, ch) if ch > 1 else row.reshape(msg.height, msg.width)
+    row: np.ndarray = buf.reshape(msg.height, msg.step // itemsize)[:, : msg.width * ch]
+    arr: np.ndarray = row.reshape(msg.height, msg.width, ch) if ch > 1 else row.reshape(msg.height, msg.width)
     arr = arr.astype(dt.newbyteorder("="), copy=True)  # native byte order, writable
 
     if to_rgb and enc in ("bgr8", "bgra8"):
@@ -83,8 +118,20 @@ def image_to_numpy(msg, to_rgb: bool = True) -> np.ndarray:
     return arr
 
 
-def stamp_ns(msg, log_time_ns: int) -> int:
-    """Sensor timestamp from the message header; falls back to the bag's log time."""
+def stamp_ns(msg: Any, log_time_ns: int) -> int:
+    """Sensor timestamp in ns from the message header.
+
+    Parameters
+    ----------
+    msg : decoded mcap_ros2 message
+    log_time_ns : int
+        The bag's log time for this message, used if the header stamp is missing or 0.
+
+    Returns
+    -------
+    int
+        ``sec * 1e9 + nanosec``, or ``log_time_ns``.
+    """
     st = getattr(getattr(msg, "header", None), "stamp", None)
     if st is not None and (st.sec or st.nanosec):
         return st.sec * 1_000_000_000 + st.nanosec
@@ -92,7 +139,18 @@ def stamp_ns(msg, log_time_ns: int) -> int:
 
 
 def list_topics(path: str | Path) -> dict[str, tuple[str, int]]:
-    """topic -> (message type, count), from the MCAP summary (fast, no decoding)."""
+    """List a bag's topics from the MCAP summary (fast, no decoding).
+
+    Parameters
+    ----------
+    path : str or Path
+        Bag folder or .mcap file.
+
+    Returns
+    -------
+    dict[str, tuple[str, int]]
+        topic -> (message type, message count), summed over all files.
+    """
     out: dict[str, tuple[str, int]] = {}
     for f in mcap_files(path):
         with open(f, "rb") as fh:
@@ -110,9 +168,21 @@ def list_topics(path: str | Path) -> dict[str, tuple[str, int]]:
 
 def iter_images(path: str | Path, topics: Sequence[str] | None = None,
                 to_rgb: bool = True) -> Iterator[tuple[str, int, np.ndarray]]:
-    """Yield (topic, stamp_ns, numpy image) for every image message, in log order.
+    """Yield every image message in log order.
 
-    topics=None reads every Image/CompressedImage topic in the bag.
+    Parameters
+    ----------
+    path : str or Path
+        Bag folder or .mcap file.
+    topics : sequence of str, optional
+        Topics to read; None reads every Image/CompressedImage topic.
+    to_rgb : bool
+        Passed to :func:`image_to_numpy`.
+
+    Yields
+    ------
+    tuple[str, int, np.ndarray]
+        (topic, stamp_ns, image) with ``image`` as in :func:`image_to_numpy`.
     """
     if topics is None:
         topics = [t for t, (ty, _) in list_topics(path).items() if ty in IMAGE_TYPES]
@@ -127,17 +197,36 @@ def iter_images(path: str | Path, topics: Sequence[str] | None = None,
 
 def pair_by_stamp(path: str | Path, topic_a: str, topic_b: str,
                   max_dt_ms: float = 20.0) -> list[tuple[int, np.ndarray, np.ndarray]]:
-    """Match each topic_a frame to the nearest topic_b frame in time (e.g. color with depth).
+    """Match each ``topic_a`` frame to the nearest ``topic_b`` frame in time.
 
-    Returns (stamp_ns of a, image a, image b). Loads both streams into memory,
-    so use it per bag, not across a whole dataset at once.
+    Parameters
+    ----------
+    path : str or Path
+        Bag folder or .mcap file.
+    topic_a, topic_b : str
+        Image topics, e.g. color and depth.
+    max_dt_ms : float
+        Largest allowed stamp difference; frames without a match are skipped.
+
+    Returns
+    -------
+    list[tuple[int, np.ndarray, np.ndarray]]
+        (stamp_ns of a, image a, image b).
+
+    Notes
+    -----
+    For each a-frame at time t_a, picks ``argmin_j |t_b[j] - t_a|`` by bisection and
+    keeps it if ``|t_b[j] - t_a| <= max_dt_ms * 1e6`` ns. Loads both streams into
+    memory, so use it per bag, not across a whole dataset at once.
     """
-    a, b = [], []
+    a: list[tuple[int, np.ndarray]] = []
+    b: list[tuple[int, np.ndarray]] = []
     for topic, ts, img in iter_images(path, [topic_a, topic_b]):
         (a if topic == topic_a else b).append((ts, img))
     b.sort(key=lambda x: x[0])
     b_ts = [t for t, _ in b]
-    out, max_dt = [], int(max_dt_ms * 1e6)
+    out: list[tuple[int, np.ndarray, np.ndarray]] = []
+    max_dt = int(max_dt_ms * 1e6)
     for ts, img in a:
         i = bisect.bisect_left(b_ts, ts)
         best = min((j for j in (i - 1, i) if 0 <= j < len(b)), key=lambda j: abs(b_ts[j] - ts), default=None)
@@ -147,7 +236,7 @@ def pair_by_stamp(path: str | Path, topic_a: str, topic_b: str,
 
 
 def save_image(arr: np.ndarray, path: Path) -> None:
-    """PNG, lossless. uint16 depth stays 16-bit; float depth is saved as .npy."""
+    """Save an image losslessly: PNG (uint16 depth stays 16-bit), or .npy for float32."""
     if arr.dtype == np.float32:
         np.save(path.with_suffix(".npy"), arr)
     else:
@@ -155,6 +244,7 @@ def save_image(arr: np.ndarray, path: Path) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """CLI: list topics, or extract images to PNG plus an index.csv per topic."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("bag", help="bag folder or single .mcap file")
     ap.add_argument("--out", default="extracted", help="output folder (default: extracted)")
@@ -171,7 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     out = Path(args.out)
     seen: dict[str, int] = {}
-    writers: dict[str, tuple[object, csv.writer]] = {}
+    writers: dict[str, tuple[IO[str], Any]] = {}   # topic -> (file, csv.writer)
     try:
         for topic, ts, img in iter_images(args.bag, args.topics):
             k = seen.get(topic, 0)

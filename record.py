@@ -29,6 +29,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import IO, Any
 
 from glide_bridge import DEFAULT_STREAMS, GLIDE_TELEMETRY, PRESETS, GlideLink
 from glide_bridge.link import DEFAULT_PORT
@@ -37,29 +38,46 @@ EXT = {"jpeg": "jpg", "png": "png", "png16": "png"}
 
 
 def slug(topic: str) -> str:
+    """Topic name -> file-safe name, e.g. ``/camera_up/color`` -> ``camera_up__color``."""
     return topic.strip("/").replace("/", "__") or "root"
 
 
 class SessionWriter:
-    def __init__(self, root: Path, names: dict[str, str]):
+    """Write relay messages to a session folder on a background thread.
+
+    Parameters
+    ----------
+    root : Path
+        Session folder.
+    names : dict[str, str]
+        Image topic -> stream folder name. Other image topics use :func:`slug`.
+
+    Notes
+    -----
+    Messages are queued (max 2000) so slow disks never block the network reader;
+    overflow is dropped and counted in ``dropped_local``.
+    """
+
+    def __init__(self, root: Path, names: dict[str, str]) -> None:
         self.root = root
         self.names = names                   # topic -> folder name for image streams
-        self.q: queue.Queue = queue.Queue(maxsize=2000)
+        self.q: queue.Queue[tuple[dict, bytes] | None] = queue.Queue(maxsize=2000)
         self.counts: dict[str, int] = {}
         self.bytes = 0
         self.dropped_local = 0
-        self._csv: dict[str, tuple] = {}
-        self._jsonl: dict[str, object] = {}
+        self._csv: dict[str, tuple[IO[str], Any, Path]] = {}   # topic -> (file, csv.writer, dir)
+        self._jsonl: dict[str, IO[str]] = {}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def on_message(self, header: dict, payload: bytes):
+    def on_message(self, header: dict, payload: bytes) -> None:
+        """GlideLink listener: queue the raw message without blocking."""
         try:
             self.q.put_nowait((header, payload))
         except queue.Full:                   # disk can't keep up; count and drop
             self.dropped_local += 1
 
-    def _run(self):
+    def _run(self) -> None:
         while True:
             item = self.q.get()
             if item is None:
@@ -70,7 +88,8 @@ class SessionWriter:
             except Exception as exc:
                 print(f"\nwrite error on {header.get('topic')}: {exc}", file=sys.stderr)
 
-    def _write(self, header: dict, payload: bytes):
+    def _write(self, header: dict, payload: bytes) -> None:
+        """Images -> ``<stream>/NNNNNN.<ext>`` plus an index.csv row; else one JSONL line."""
         topic = header["topic"]
         n = self.counts.get(topic, 0)
         enc = header.get("enc")
@@ -104,7 +123,8 @@ class SessionWriter:
         self.counts[topic] = n + 1
         self.bytes += len(payload)
 
-    def close(self):
+    def close(self) -> None:
+        """Drain the queue (up to 30 s) and close all files."""
         self.q.put(None)
         self._thread.join(timeout=30)
         for f, _, _ in self._csv.values():
@@ -183,7 +203,7 @@ def main() -> int:
     link = None
     reconnects = 0
     t0 = time.time()
-    last = (t0, {})
+    last: tuple[float, dict[str, int]] = (t0, {})
     try:
         while not stop.is_set():
             if args.duration and time.time() - t0 >= args.duration:
