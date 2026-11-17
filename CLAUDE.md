@@ -74,6 +74,13 @@ telemetry data to a laptop and, via ROS 2, into the perception pipeline.
     all cameras intact). `_0` was damaged (never finalized, mostly zero bytes) and was
     deleted locally. As of 2026-11-14 neither part is on Drive any more; the local `_1`
     is the only copy.
+- Forward-camera frames missing from bags (2026-11-17 finding, still being investigated):
+  both cameras run at 6 fps (`camera_info` ~5.7-6 Hz each). The on-robot reducer keeps a
+  color/depth pair only when their stamps are within ~10 ms. The up camera's depth stamp
+  often sits ~33 or ~65 ms behind color for long stretches, so those pairs are dropped.
+  The down camera stays within ~1 ms. Plot: `data/plots/color_depth_sync.png`. The robot
+  filesystem copy (`data/robot_fs/onboard_codes.zip`, from Jiatong, contains secrets) is
+  from ~May 2026, before the July collection-config changes.
 - Bags can come off the robot unfinalized. A file whose last 8 bytes aren't the MCAP
   magic (`89 4d 43 41 50 30 0d 0a`) is incomplete; check before debugging the replay.
 
