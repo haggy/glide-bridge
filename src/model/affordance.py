@@ -6,11 +6,24 @@ from ultralytics import YOLO
 
 @dataclass
 class HeadOutput:
-    one2one: list[torch.Tensor] | None = None
-    one2many: list[torch.Tensor] | None = None
+    boxes: torch.Tensor  # (B, )
+    scores: torch.Tensor
+    classes: torch.Tensor
+    # Pyramid feature network layer outputs
+    # p3: (B, C, H/8, W/8)
+    # p4: (B, C, H/16, W/16)
+    # p5: (B, C, H/32, W/32)
+    p3: torch.Tensor
+    p4: torch.Tensor
+    p5: torch.Tensor
+
 
     @classmethod
-    def create(cls, pyramid_feature_output: dict[str, list[torch.Tensor]]) -> "HeadOutput":
+    def create(cls, 
+               y: torch.Tensor, 
+               pyramid_feature_output: dict[str, list[torch.Tensor]], 
+               score_threshold: float = 0.25
+    ) -> "HeadOutput":
         """
         Pyramid output dict is expected to have this structure:
 
@@ -35,9 +48,26 @@ class HeadOutput:
             },
         }
         """
+        # y shape: (B, 300, 6)
+        # 300: is the max number of detections
+        # size 6 is the data: first 4 is box, 5 is the score, 6 is the class
+        scores = y[..., 4]
+        score_filter = scores > score_threshold
+
+        y_thresh = y[score_filter]
+        p_feat_thresh = pyramid_feature_output["one2one"]["feats"]
+
+        boxes = y_thresh[..., :4]
+        classes = y_thresh[..., 5].long()
+        p3, p4, p5 = p_feat_thresh
+
         return cls(
-            one2one=pyramid_feature_output.get("one2one"),
-            one2many=pyramid_feature_output.get("one2many"),
+            boxes=boxes,
+            scores=scores,
+            classes=classes,
+            p3=p3,
+            p4=p4,
+            p5=p5,
         )
 
     def _get_pyramid_level(self, level: int) -> torch.Tensor:
@@ -74,6 +104,10 @@ class AffordGlide(torch.nn.Module):
         # Lock into eval mode. Frozen and used only for feature extraction
         self._feature_extractor = YOLO("yolo26n.pt").model.eval()
 
+        # Enabling end to end results in roughly 1 prediction per observation
+        # i.e. Each detection keeps only its winning class
+        self._feature_extractor.model[-1].end2end = True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
 
@@ -94,15 +128,12 @@ class AffordGlide(torch.nn.Module):
         print(f"Input shape: {x.shape}")
 
         with torch.no_grad():
-            _ = self._feature_extractor(x)
-        
-        for i, feat in enumerate(pyramid_features["neck_inputs"]):
-            print(f"P{i+3} input shape: {feat.shape}")  # Strides 8, 16, 32
-        
+            y, preds = self._feature_extractor(x)
 
-        ho = HeadOutput.create(pyramid_features["head_outputs"])
-        print(f"HO P5 shape: {ho.get_p5().shape}")
-        print(f"HO P5 channel 0: {ho.get_p5()[:, 0, ::].shape}")
+        ho = HeadOutput.create(y, preds)
+
+        print(f"HO P5 shape: {ho.p5.shape}")
+        print(f"HO P5 channel 0: {ho.p5[:, 0, ::].shape}")
         
         handle.remove()
 
