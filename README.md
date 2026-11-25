@@ -183,7 +183,7 @@ every color frame after `ObjectDetection.apply_bounding_boxes`
 (`src/img_processing/obj_detection.py`); `--no-detections` turns it off. Each stream keeps its own
 recorded timing (`--rate 2` plays at 2x), and the viewer updates each panel only when
 that camera delivers a frame, so cameras with different rates or dropouts preview
-independently. `--snapshot out.png` saves the window as it last looked. Frames are stamped with the publish time, so the viewer can show latency.
+independently. `--snapshot out.png` saves the window as it last looked, and `--record out.mp4` saves it as a video (`./demos/record_bag_video.sh BAG OUT.mp4 --rate 6` records one pass of a bag offscreen). Frames are stamped with the publish time, so the viewer can show latency.
 To debug in VS Code (e.g. breakpoints in `src/img_processing/obj_detection.py`), run the
 "Camera window + bag replay" launch config; it starts both under the `glide_ros` env.
 `env/activate_ros.sh` uses Cyclone DDS like the robot and keeps traffic on localhost.

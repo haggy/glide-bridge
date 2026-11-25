@@ -19,6 +19,13 @@ Examples
     python -m glide_bridge.ros.viewer --duration 30 --plot data/plots/timing.png
     python -m glide_bridge.ros.viewer --headless --duration 20 --plot timing.png
     python -m glide_bridge.ros.viewer --no-detections     # skip the detection row
+    python -m glide_bridge.ros.viewer --record data/videos/window.mp4   # also save video
+    python -m glide_bridge.ros.viewer --headless --record out.mp4       # offscreen video
+
+With ``--record`` the window is written to a video at ``--record-fps`` (wall-clock
+time, so playback speed matches what was on screen). With ``--headless`` the same
+window is drawn offscreen instead of shown. ``demos/record_bag_video.sh`` records one
+pass of a bag this way.
 
 Close the window (or Ctrl-C) to stop. With ``--plot`` a figure is saved showing, per
 stream, the inter-arrival interval, the latency, an interval histogram, and a few
@@ -32,7 +39,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import matplotlib
 import numpy as np
@@ -63,6 +70,80 @@ def detection_stream(source: CameraStream) -> CameraStream:
     """
     cam = source.name.partition("_")[0]
     return CameraStream(f"{cam}_detections", source.base_topic, "detections")
+
+
+class VideoRecorder:
+    """Write a matplotlib figure to a video file at a fixed wall-clock frame rate.
+
+    Parameters
+    ----------
+    path : Path
+        Output file. ``.mp4`` uses H.264 if OpenCV has it, else MPEG-4 Part 2
+        (``mp4v``); ``.avi`` uses Motion JPEG.
+    fps : float
+        Video frame rate, frames/s.
+
+    Notes
+    -----
+    Recording starts at the first :meth:`grab`. Each grab writes as many copies of the
+    current canvas as are due, ``n_due = floor((t - t0) * fps) - n_written``, so video
+    time tracks wall time even when the GUI timer runs late. Frames keep the size of the
+    first grab (later ones are resized; H.264 needs even sizes, so it is rounded down).
+    """
+
+    def __init__(self, path: Path, fps: float) -> None:
+        self.path = path
+        self.fps = fps
+        self._writer = None                       # cv2.VideoWriter, opened on first grab
+        self._size: tuple[int, int] = (0, 0)      # (W, H) px
+        self._t0 = 0.0
+        self.n_written = 0
+
+    def _open(self, size: tuple[int, int]) -> None:
+        import cv2
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        codecs = ("avc1", "mp4v") if self.path.suffix.lower() == ".mp4" else ("MJPG",)
+        level = cv2.getLogLevel()
+        cv2.setLogLevel(0)  # silent: a failed try logs an error
+        try:
+            writers = [cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*c), self.fps, size)
+                       for c in codecs[:1]]
+        finally:
+            cv2.setLogLevel(level)
+        for codec in codecs:
+            w = (writers.pop() if writers else
+                 cv2.VideoWriter(str(self.path), cv2.VideoWriter_fourcc(*codec), self.fps, size))
+            if w.isOpened():
+                self._writer, self._size, self.codec = w, size, codec
+                return
+        raise RuntimeError(f"OpenCV can't write {self.path} (tried {', '.join(codecs)})")
+
+    def grab(self, fig: "matplotlib.figure.Figure") -> None:
+        """Append the figure's last drawn canvas, repeated as wall time requires."""
+        import cv2
+        rgba: np.ndarray = np.asarray(fig.canvas.buffer_rgba())   # (H, W, 4) uint8
+        if self._writer is None:
+            h, w = rgba.shape[:2]
+            self._open((w - w % 2, h - h % 2))
+            self._t0 = time.time()
+        bgr: np.ndarray = cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGR)
+        if bgr.shape[1::-1] != self._size:
+            bgr = cv2.resize(bgr, self._size, interpolation=cv2.INTER_AREA)
+        n_due = int((time.time() - self._t0) * self.fps) + 1 - self.n_written
+        for _ in range(max(n_due, 0)):
+            self._writer.write(bgr)
+        self.n_written += max(n_due, 0)
+
+    def close(self) -> None:
+        """Finish the file and print what was written."""
+        if self._writer is None:
+            print(f"no video written to {self.path} (nothing was drawn)")
+            return
+        self._writer.release()
+        self._writer = None
+        print(f"saved video {self.path}: {self.n_written} frames, "
+              f"{self.n_written / self.fps:.1f} s at {self.fps:g} fps ({self.codec}, "
+              f"{self._size[0]}x{self._size[1]})")
 
 
 def panel_label(stream: CameraStream) -> str:
@@ -311,6 +392,67 @@ def save_report(monitors: list[StreamMonitor], path: Path, depth_max_m: float = 
         print(f"  {line}")
 
 
+def build_window(monitors: Sequence[StreamMonitor], depth_max: float,
+                 ) -> tuple["matplotlib.figure.Figure", Callable[[int], list]]:
+    """Make the viewer figure and the function that refreshes its panels.
+
+    Parameters
+    ----------
+    monitors : sequence of StreamMonitor
+        One panel each, placed by :func:`grid_layout`.
+    depth_max : float
+        Depth colour range, m.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    update : callable
+        ``update(frame_index) -> []``: redraws each panel whose stream has a new frame
+        since the last call (the signature ``FuncAnimation`` expects).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    cells, n_rows, n_cols = grid_layout([m.stream for m in monitors])
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.4 * n_cols, 4.0 * n_rows),
+                             squeeze=False, layout="constrained")
+    fig.canvas.manager.set_window_title("Glide camera streams")
+    used = set(cells.values())
+    for (r, c), ax in np.ndenumerate(axes):
+        if (r, c) not in used:
+            ax.set_visible(False)
+    panels = []
+    for m in monitors:
+        ax = axes[cells[m.stream.name]]
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlabel(m.stream.base_topic, fontsize=9, family="monospace")
+        ax.set_title(f"{panel_label(m.stream)}: waiting ...", fontsize=10)
+        if m.stream.kind == "depth":
+            fig.colorbar(ScalarMappable(Normalize(0, depth_max), "turbo"), ax=ax,
+                         shrink=0.85, label="depth (m), black = no reading")
+        panels.append((ax, ax.imshow(np.zeros((2, 2, 3), np.uint8)), [-1]))
+
+    def update(_: int) -> list:
+        for m, (ax, im, shown) in zip(monitors, panels):
+            item = m.latest()
+            if item is None or item[0] == shown[0]:
+                continue          # this stream has nothing new; others may
+            k, img = item
+            shown[0] = k
+            rgb = to_display(img, m.encoding, depth_max)
+            if im.get_array().shape[:2] != rgb.shape[:2]:
+                im.set_extent((-0.5, rgb.shape[1] - 0.5, rgb.shape[0] - 0.5, -0.5))
+            im.set_data(rgb)
+            lat = m.last_latency()
+            ax.set_title(f"{panel_label(m.stream)}   frame {k}   "
+                         f"{m.fps():.1f} fps   latency {lat * 1e3:.1f} ms",
+                         fontsize=10)
+        return []
+
+    return fig, update
+
+
 def parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str]]:
     """Parse our options; everything else (``--ros-args ...``) is passed to rclpy."""
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -324,7 +466,11 @@ def parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str
     p.add_argument("--snapshot", type=Path,
                    help="save the window as it last looked to this PNG on exit")
     p.add_argument("--headless", action="store_true",
-                   help="no window; just collect stats (use with --plot)")
+                   help="no window; just collect stats (use with --plot), or draw the "
+                        "window offscreen with --record")
+    p.add_argument("--record", type=Path,
+                   help="save the window as a video (.mp4, or .avi for Motion JPEG)")
+    p.add_argument("--record-fps", type=float, default=15.0, help="video frame rate")
     p.add_argument("--thumbs", type=int, default=6, help="frames per stream in the report")
     p.add_argument("--depth-max", type=float, default=5.0, help="depth colour range, m")
     p.add_argument("--no-detections", action="store_true",
@@ -340,7 +486,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     import rclpy
-    from rclpy.executors import SingleThreadedExecutor
+    from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Image
@@ -355,6 +501,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.no_detections:
         from src.img_processing.obj_detection import ObjectDetection
         detector = ObjectDetection()
+        # Warm up (model load to GPU, first-call setup) before frames arrive.
+        detector.apply_bounding_boxes(np.zeros((360, 640, 3), np.uint8))
         detections = {m.stream.name: StreamMonitor(detection_stream(m.stream), args.thumbs)
                       for m in sources if m.stream.kind == "color"}
     monitors = sources + list(detections.values())
@@ -379,56 +527,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                                + (f" (+ {det.stream.name})" if det else ""))
     executor = SingleThreadedExecutor()
     executor.add_node(node)
-    threading.Thread(target=executor.spin, daemon=True).start()
+
+    def spin() -> None:
+        try:
+            executor.spin()
+        except ExternalShutdownException:
+            pass                  # Ctrl-C / SIGINT shut the context down: normal stop
+
+    spin_thread = threading.Thread(target=spin, daemon=True)
+    spin_thread.start()
     t_start = time.time()
 
+    recorder = VideoRecorder(args.record, args.record_fps) if args.record else None
     try:
-        if args.headless:
-            while args.duration is None or time.time() - t_start < args.duration:
+        if args.headless and recorder is not None:
+            # Offscreen: refresh, draw and grab on our own clock.
+            fig, update = build_window(monitors, args.depth_max)
+            started = False
+            while rclpy.ok() and (args.duration is None
+                                  or time.time() - t_start < args.duration):
+                t_next = time.time() + 1 / args.record_fps
+                update(0)
+                started = started or any(m.recv for m in monitors)
+                if started:               # start the video at the first frame
+                    fig.canvas.draw()
+                    recorder.grab(fig)
+                time.sleep(max(t_next - time.time(), 0.0))
+        elif args.headless:
+            while rclpy.ok() and (args.duration is None
+                                  or time.time() - t_start < args.duration):
                 time.sleep(0.1)
         else:
-            from matplotlib.cm import ScalarMappable
-            from matplotlib.colors import Normalize
-
-            cells, n_rows, n_cols = grid_layout([m.stream for m in monitors])
-            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6.4 * n_cols, 4.0 * n_rows),
-                                     squeeze=False, layout="constrained")
-            fig.canvas.manager.set_window_title("Glide camera streams")
-            used = set(cells.values())
-            for (r, c), ax in np.ndenumerate(axes):
-                if (r, c) not in used:
-                    ax.set_visible(False)
-            panels = []
-            for m in monitors:
-                ax = axes[cells[m.stream.name]]
-                ax.set_xticks([]); ax.set_yticks([])
-                ax.set_xlabel(m.stream.base_topic, fontsize=9, family="monospace")
-                ax.set_title(f"{panel_label(m.stream)}: waiting ...", fontsize=10)
-                if m.stream.kind == "depth":
-                    fig.colorbar(ScalarMappable(Normalize(0, args.depth_max), "turbo"), ax=ax,
-                                 shrink=0.85, label="depth (m), black = no reading")
-                panels.append((ax, ax.imshow(np.zeros((2, 2, 3), np.uint8)), [-1]))
-
-            def update(_: int) -> list:
-                for m, (ax, im, shown) in zip(monitors, panels):
-                    item = m.latest()
-                    if item is None or item[0] == shown[0]:
-                        continue          # this stream has nothing new; others may
-                    k, img = item
-                    shown[0] = k
-                    rgb = to_display(img, m.encoding, args.depth_max)
-                    if im.get_array().shape[:2] != rgb.shape[:2]:
-                        im.set_extent((-0.5, rgb.shape[1] - 0.5, rgb.shape[0] - 0.5, -0.5))
-                    im.set_data(rgb)
-                    lat = m.last_latency()
-                    ax.set_title(f"{panel_label(m.stream)}   frame {k}   "
-                                 f"{m.fps():.1f} fps   latency {lat * 1e3:.1f} ms",
-                                 fontsize=10)
-                return []
-
+            fig, update = build_window(monitors, args.depth_max)
             # Poll at ~30 Hz and redraw a panel only when its stream has a new frame,
             # so each panel runs at its own camera's rate.
             anim = FuncAnimation(fig, update, interval=33, cache_frame_data=False)
+            if recorder is not None:
+                # Grab what was last drawn; starts once any stream has delivered.
+                rec_timer = fig.canvas.new_timer(interval=int(1000 / args.record_fps))
+                rec_timer.add_callback(
+                    lambda: recorder.grab(fig) if any(m.recv for m in monitors) else None)
+                rec_timer.start()
             if args.duration is not None:
                 closer = fig.canvas.new_timer(interval=int(args.duration * 1000))
                 closer.single_shot = True
@@ -443,10 +582,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if recorder is not None:
+            recorder.close()
         executor.shutdown()
-        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        # Exiting while the spin thread is still inside rclpy aborts the process
+        # ("terminate called without an active exception").
+        spin_thread.join(timeout=2.0)
+        node.destroy_node()
 
     for m in monitors:
         print(f"{m.stream.name}: received {len(m.recv)} frames on {m.stream.base_topic}")
