@@ -147,6 +147,11 @@ conda env create -f env/ros_humble.yml        # once
 source env/activate_ros.sh && pip install -e . --no-deps   # once
 ```
 
+The env includes Ultralytics YOLO for `src/img_processing/`, with numpy kept below 2
+(Humble's packages break on numpy 2). To update an existing env, run
+`conda env update -n glide_ros -f env/ros_humble.yml` from a shell where
+`glide_ros` is not active.
+
 Get bags from the project's Google Drive "Data" folder with `fetch_bags.sh` (uses
 [rclone](https://rclone.org), installed as a single binary in `~/.local/bin`; read-only
 access with your own Google login):
@@ -161,7 +166,7 @@ access with your own Google login):
 Then:
 
 ```bash
-./demos/stream_demo.sh data/bags/<recording>   # replay + 2x2 window (see below)
+./demos/stream_demo.sh data/bags/<recording>   # replay + camera window (see below)
 ./demos/stream_demo.sh data/bags/<recording> --rate 6 --streams up_color down_color
 ./demos/stream_demo.sh                        # synthetic bag: up 6 fps, down 2 fps
 
@@ -173,10 +178,14 @@ python -m glide_bridge.ros.viewer --plot data/plots/timing.png   # window + timi
 
 Both default to `--streams up_color down_color up_depth down_depth`, which the viewer
 lays out as a grid: a column per camera (forward/up left, down right) and a row per
-kind (color on top, depth below, with a colorbar in metres). Each stream keeps its own
+kind (color on top, depth below, with a colorbar in metres). A third row shows
+every color frame after `ObjectDetection.apply_bounding_boxes`
+(`src/img_processing/obj_detection.py`); `--no-detections` turns it off. Each stream keeps its own
 recorded timing (`--rate 2` plays at 2x), and the viewer updates each panel only when
 that camera delivers a frame, so cameras with different rates or dropouts preview
-independently. `--snapshot out.png` saves the window as it last looked. Frames are stamped with the publish time, so the viewer can show latency.
+independently. `--snapshot out.png` saves the window as it last looked, and `--record out.mp4` saves it as a video (`./demos/record_bag_video.sh BAG OUT.mp4 --rate 6` records one pass of a bag offscreen). Frames are stamped with the publish time, so the viewer can show latency.
+To debug in VS Code (e.g. breakpoints in `src/img_processing/obj_detection.py`), run the
+"Camera window + bag replay" launch config; it starts both under the `glide_ros` env.
 `env/activate_ros.sh` uses Cyclone DDS like the robot and keeps traffic on localhost.
 
 ## Simulators

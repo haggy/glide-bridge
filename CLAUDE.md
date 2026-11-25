@@ -34,6 +34,17 @@ telemetry data to a laptop and, via ROS 2, into the perception pipeline.
 - Conda env `glide_ros` (`env/ros_humble.yml`, ROS 2 Humble from RoboStack, Python
   3.11): everything under `glide_bridge/ros/` and the ROS scripts. Humble matches the
   robot. Activate with `source env/activate_ros.sh`.
+- `glide_ros` must keep **numpy < 2** (RoboStack Humble is built against 1.x). When
+  adding pip packages there (e.g. ultralytics), pin `numpy<2` and any dep that would
+  force numpy 2 (`opencv-python<4.12`); check with `pip install --dry-run` first.
+- `glide_ros` pins the **pthreads build of OpenBLAS** (`libopenblas=*=*pthreads*`). The
+  default OpenMP build loads conda's libomp with numpy, pip torch loads its own OpenMP,
+  and the two segfault together (it shows up as the viewer crashing once detection
+  runs). If a segfault appears with torch, check `OMP_NUM_THREADS=1` first: if that
+  fixes it, it's duplicate OpenMP runtimes again.
+- VS Code debugging of ROS code: `.vscode/launch.json` ("Camera window + bag replay")
+  runs under `glide_ros` via `env/vscode_env.sh`, which exports the activated env to
+  `.vscode/ros.env` + `.vscode/ros-python` (git-ignored, regenerated each launch).
 - Never import `rclpy` from modules the uv env loads; ROS code lives in
   `glide_bridge/ros/` only.
 
@@ -61,7 +72,15 @@ telemetry data to a laptop and, via ROS 2, into the perception pipeline.
     (forward) color camera dropped out (13 frames); the down camera has 172.
   - `rosbag2_alpha_033_2026-11-12_21-10-16`: only `_1` kept (13.7 s, 13 frames/camera,
     all cameras intact). `_0` was damaged (never finalized, mostly zero bytes) and was
-    deleted locally; the user is removing it from Drive and recording new bags.
+    deleted locally. As of 2026-11-14 neither part is on Drive any more; the local `_1`
+    is the only copy.
+- Forward-camera frames missing from bags (2026-11-17 finding, still being investigated):
+  both cameras run at 6 fps (`camera_info` ~5.7-6 Hz each). The on-robot reducer keeps a
+  color/depth pair only when their stamps are within ~10 ms. The up camera's depth stamp
+  often sits ~33 or ~65 ms behind color for long stretches, so those pairs are dropped.
+  The down camera stays within ~1 ms. Plot: `data/plots/color_depth_sync.png`. The robot
+  filesystem copy (`data/robot_fs/onboard_codes.zip`, from Jiatong, contains secrets) is
+  from ~May 2026, before the July collection-config changes.
 - Bags can come off the robot unfinalized. A file whose last 8 bytes aren't the MCAP
   magic (`89 4d 43 41 50 30 0d 0a`) is incomplete; check before debugging the replay.
 
@@ -74,6 +93,10 @@ telemetry data to a laptop and, via ROS 2, into the perception pipeline.
   Glide later) publish there, and consumers subscribe by stream name, so moving to the
   robot needs no remapping. Bag topics like `..._rfps` are republished without the suffix.
   (This replaced an earlier single `/camera_raw` topic.)
+- Only one source should publish on the camera topics at a time. Two replays (or a
+  replay plus the robot) on the same `ROS_DOMAIN_ID` interleave their frames in the
+  viewer. Before debugging a "wrong images" report, check
+  `ps -eo pid,args | grep glide_bridge.ros.replay` for leftover replays.
 - Streams are independent: different rates and dropouts per camera are normal; never
   assume frames from two cameras arrive paired.
 - Sensor QoS: best effort, keep last, small depth, so slow consumers drop frames
