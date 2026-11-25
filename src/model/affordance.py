@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from ultralytics import YOLO
 
 
@@ -91,7 +93,7 @@ class HeadOutput:
         return self._get_pyramid_level(5)
 
 
-class AffordGlide(torch.nn.Module):
+class AffordGlide(nn.Module):
     """
     The Glide affordance model
 
@@ -107,6 +109,10 @@ class AffordGlide(torch.nn.Module):
         # Enabling end to end results in roughly 1 prediction per observation
         # i.e. Each detection keeps only its winning class
         self._feature_extractor.model[-1].end2end = True
+
+        self._p5_upsample = nn.Upsample(scale_factor=4)
+        self._p4_upsample = nn.Upsample(scale_factor=2)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -126,5 +132,28 @@ class AffordGlide(torch.nn.Module):
         print(f"HO P5 shape: {ho.p5.shape}")
         print(f"HO P5 channel 0: {ho.p5[:, 0, ::].shape}")
 
+        # Align all with p5 so that its large number of channels doesn't dominate
+        # Done via a 2D convolution with 1x1 kernel 
+        out_channels = ho.p5.shape[1]
+        kernel_size = 1
 
+        p3_in_channels, p4_in_channels, p5_in_channels = (ho.p3.shape[1], ho.p4.shape[1], ho.p5.shape[1])
+
+        p3_conv = nn.functional.conv2d(
+            ho.p3, 
+            weight=torch.randn(out_channels, p3_in_channels, kernel_size, kernel_size)
+        )
+        p4_conv = nn.functional.conv2d(
+            ho.p4, 
+            weight=torch.randn(out_channels, p4_in_channels, kernel_size, kernel_size)
+        )
+        p5_conv = nn.functional.conv2d(
+            ho.p5, 
+            weight=torch.randn(out_channels, p5_in_channels, kernel_size, kernel_size)
+        )
+
+        # Upsampling now that channels are aligned
+        p4_conv = self._p4_upsample(p4_conv)
+        p5_conv = self._p5_upsample(p5_conv)
+        
         return torch.zeros((B, H, W), dtype=torch.float32)
