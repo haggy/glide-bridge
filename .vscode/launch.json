@@ -7,6 +7,18 @@
     "version": "0.2.0",
     "configurations": [
         {
+            // Model code: uv venv, no ROS. Run as a module so `src` imports resolve.
+            "name": "Affordance model",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "src.model.main",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
             "name": "Camera window (viewer)",
             "type": "debugpy",
             "request": "launch",
