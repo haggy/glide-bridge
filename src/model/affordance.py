@@ -111,18 +111,9 @@ class AffordGlide(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
 
-        pyramid_features = {}
-        
-        def hook_fn(module, inputs, outputs):
-            # inputs[0] is a list of 3 tensors corresponding to [P3, P4, P5] from the neck
-            pyramid_features["neck_inputs"] = [f.detach() for f in inputs[0]]
-            pyramid_features["head_outputs"] = outputs
-
-
         detect_head = self._feature_extractor.model[-1]
         print("Pyramid strides (P3, P4, P5):", detect_head.stride)  # Usually tensor([ 8., 16., 32.])
         print("Input layers from neck:", detect_head.f)
-        handle = detect_head.register_forward_hook(hook_fn)
         
         # Run a dummy forward pass
         print(f"Input shape: {x.shape}")
@@ -134,7 +125,6 @@ class AffordGlide(torch.nn.Module):
 
         print(f"HO P5 shape: {ho.p5.shape}")
         print(f"HO P5 channel 0: {ho.p5[:, 0, ::].shape}")
-        
-        handle.remove()
+
 
         return torch.zeros((B, H, W), dtype=torch.float32)
