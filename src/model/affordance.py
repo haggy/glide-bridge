@@ -103,16 +103,52 @@ class AffordGlide(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Lock into eval mode. Frozen and used only for feature extraction
-        self._feature_extractor = YOLO("yolo26n.pt").model.eval()
+        self._feature_extractor = YOLO("yolo26n.pt").model
 
         # Enabling end to end results in roughly 1 prediction per observation
         # i.e. Each detection keeps only its winning class
         self._feature_extractor.model[-1].end2end = True
 
+        self._final_output_channels = 256
+
+        # Convolution across all pyramid levels 
+        # Brings all up to the desired final output channel 
+        self._p3_convulve = nn.Conv2d(
+            in_channels=64, 
+            out_channels=self._final_output_channels, 
+            kernel_size=1
+        )
+
+        self._p4_convulve = nn.Conv2d(
+            in_channels=128, 
+            out_channels=self._final_output_channels, 
+            kernel_size=1
+        )
+
+        self._p5_convulve = nn.Conv2d(
+            in_channels=self._final_output_channels, 
+            out_channels=self._final_output_channels, 
+            kernel_size=1
+        )
+        
         self._p5_upsample = nn.Upsample(scale_factor=4)
         self._p4_upsample = nn.Upsample(scale_factor=2)
 
+        self.heatmap_head = nn.Sequential(
+            nn.Conv2d(
+                in_channels=self._final_output_channels * 3, 
+                out_channels=1,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.Upsample(scale_factor=8),
+        )
+
+    def train(self, mode: bool = True) -> "AffordGlide":
+        super().train(mode)
+        # Lock into eval mode. Frozen and used only for feature extraction
+        self._feature_extractor.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -134,26 +170,18 @@ class AffordGlide(nn.Module):
 
         # Align all with p5 so that its large number of channels doesn't dominate
         # Done via a 2D convolution with 1x1 kernel 
-        out_channels = ho.p5.shape[1]
-        kernel_size = 1
+        # Assert here to ensure it stays aligned with expectations
+        assert ho.p5.shape[1] == self._final_output_channels
 
-        p3_in_channels, p4_in_channels, p5_in_channels = (ho.p3.shape[1], ho.p4.shape[1], ho.p5.shape[1])
+        p3_conv = self._p3_convulve(ho.p3)
+        p4_conv = self._p4_convulve(ho.p4)
+        p5_conv = self._p5_convulve(ho.p5)
 
-        p3_conv = nn.functional.conv2d(
-            ho.p3, 
-            weight=torch.randn(out_channels, p3_in_channels, kernel_size, kernel_size)
-        )
-        p4_conv = nn.functional.conv2d(
-            ho.p4, 
-            weight=torch.randn(out_channels, p4_in_channels, kernel_size, kernel_size)
-        )
-        p5_conv = nn.functional.conv2d(
-            ho.p5, 
-            weight=torch.randn(out_channels, p5_in_channels, kernel_size, kernel_size)
-        )
-
-        # Upsampling now that channels are aligned
+        # Upsample to match p3 now that channels are aligned
         p4_conv = self._p4_upsample(p4_conv)
         p5_conv = self._p5_upsample(p5_conv)
-        
-        return torch.zeros((B, H, W), dtype=torch.float32)
+
+        heatmap = self.heatmap_head(torch.cat([p3_conv, p4_conv, p5_conv], dim=1))
+
+        # Transform (B, 1, H, W) -> (B, H, W)
+        return heatmap.squeeze(1)
