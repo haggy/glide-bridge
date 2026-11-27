@@ -93,10 +93,12 @@ case "$cmd" in
         pattern="*.mcap"
         [[ $# -gt 0 ]] && pattern="*$1*.mcap"
         # copyto per file into its recording folder. Never deletes local files; skips
-        # files already present with the same size and time.
-        rclone lsf "${REMOTE}:" "${FOLDER_ARGS[@]}" --files-only --include "$pattern" |
-        while IFS= read -r name; do
-            rclone copyto "${REMOTE}:$name" "$DEST/$(recording_of "$name")/$name" \
+        # files already present with the same size and time. -R: bags may sit in
+        # per-recording subfolders on Drive (as `list` shows); the local layout is the same.
+        rclone lsf -R "${REMOTE}:" "${FOLDER_ARGS[@]}" --files-only --include "$pattern" |
+        while IFS= read -r path; do
+            name="$(basename "$path")"
+            rclone copyto "${REMOTE}:$path" "$DEST/$(recording_of "$name")/$name" \
                 "${FOLDER_ARGS[@]}" --progress
         done
         show_bags

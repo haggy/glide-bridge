@@ -32,6 +32,10 @@ dependencies:
       # YOLO for src/img_processing. Pulls torch (CUDA build on Linux, a few GB; for
       # CPU only, first: pip install torch torchvision --index-url
       # https://download.pytorch.org/whl/cpu).
-      - ultralytics>=8.3
+      # Same versions as the `model` group in pyproject.toml (the uv venv). Intel Macs
+      # have no current torch wheels, so ultralytics picks an older one there.
+      - "torch==2.15.*; sys_platform != 'darwin' or platform_machine != 'x86_64'"
+      - "torchvision==0.29.*; sys_platform != 'darwin' or platform_machine != 'x86_64'"
+      - ultralytics==8.4.213
       - numpy<2                # don't let ultralytics' deps upgrade numpy
       - opencv-python<4.12     # 4.12+ requires numpy 2
