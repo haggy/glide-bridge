@@ -4,7 +4,11 @@
 One panel per stream, laid out with a column per camera (forward/up, down) and a
 row per image kind (color on top, depth below). A third row shows each color frame
 after :meth:`src.img_processing.obj_detection.ObjectDetection.apply_bounding_boxes`,
-which runs on every received color frame of both cameras. Each panel updates
+which runs on every received color frame of both cameras. With ``--affordance`` that
+row is replaced by the affordance model (:mod:`src.model.infer`): on the left, the up
+camera's color with the predicted sittability heatmap overlaid; on the right, the
+bird's-eye view of that heatmap, projected with the up camera's depth (forward up,
+1 m grid, camera = cyan triangle at the bottom). Each panel updates
 independently whenever its own topic delivers a frame. This
 is the consumer end of the pipeline and the visual check for it: if each panel shows
 frames in order at its camera's rate with low latency, the pub/sub path works.
@@ -19,6 +23,8 @@ Examples
     python -m glide_bridge.ros.viewer --duration 30 --plot data/plots/timing.png
     python -m glide_bridge.ros.viewer --headless --duration 20 --plot timing.png
     python -m glide_bridge.ros.viewer --no-detections     # skip the detection row
+    python -m glide_bridge.ros.viewer --affordance        # heatmap + BEV row, newest best.pt
+    python -m glide_bridge.ros.viewer --affordance data/runs/RUN/best.pt
     python -m glide_bridge.ros.viewer --record data/videos/window.mp4   # also save video
     python -m glide_bridge.ros.viewer --headless --record out.mp4       # offscreen video
 
@@ -38,6 +44,7 @@ import argparse
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -48,8 +55,10 @@ from ..topics import CameraStream
 from . import DEFAULT_STREAMS, GLIDE_STREAMS
 
 CAMERA_LABELS: dict[str, str] = {"up": "forward (up)", "down": "downward"}
-# Top to bottom. "detections" is derived in the viewer, not a robot topic.
-KIND_ROWS: tuple[str, ...] = ("color", "depth", "detections", "mono", "labels")
+# Top to bottom. "detections" and "affordance" are derived in the viewer, not robot topics.
+KIND_ROWS: tuple[str, ...] = ("color", "depth", "detections", "affordance", "mono", "labels")
+PSEUDO_LABELS: dict[str, str] = {"up_heatmap": "forward (up) sittability heatmap",
+                                 "up_bev": "bird's-eye view of the heatmap (from up depth)"}
 
 
 def detection_stream(source: CameraStream) -> CameraStream:
@@ -148,6 +157,8 @@ class VideoRecorder:
 
 def panel_label(stream: CameraStream) -> str:
     """Short panel title, e.g. ``forward (up) depth``."""
+    if stream.name in PSEUDO_LABELS:
+        return PSEUDO_LABELS[stream.name]
     cam, _, rest = stream.name.partition("_")
     return f"{CAMERA_LABELS[cam]} {rest}" if cam in CAMERA_LABELS and rest else stream.name
 
@@ -173,6 +184,11 @@ def grid_layout(streams: Sequence[CameraStream]) -> tuple[dict[str, tuple[int, i
     --------
     ``up_color, down_color, up_depth, down_depth`` gives a 2x2 grid with up on the
     left, down on the right, color on top and depth below.
+
+    Notes
+    -----
+    A ``<camera>_bev`` stream goes one column right of its camera (the BEV sits next to
+    the heatmap it projects), adding a column if needed.
     """
     cams: list[str] = []
     for s in streams:
@@ -182,10 +198,13 @@ def grid_layout(streams: Sequence[CameraStream]) -> tuple[dict[str, tuple[int, i
     kinds = [k for k in KIND_ROWS if any(s.kind == k for s in streams)]
     kinds += sorted({s.kind for s in streams} - set(kinds))
     cells: dict[str, tuple[int, int]] = {}
+    n_cols = len(cams)
     for s in streams:
         cam = s.name.partition("_")[0] if s.name.partition("_")[2] else s.name
-        cells[s.name] = (kinds.index(s.kind), cams.index(cam))
-    return cells, len(kinds), len(cams)
+        col = cams.index(cam) + (1 if s.name.endswith("_bev") else 0)
+        n_cols = max(n_cols, col + 1)
+        cells[s.name] = (kinds.index(s.kind), col)
+    return cells, len(kinds), n_cols
 
 
 class StreamMonitor:
@@ -392,6 +411,84 @@ def save_report(monitors: list[StreamMonitor], path: Path, depth_max_m: float = 
         print(f"  {line}")
 
 
+class AffordanceWorker:
+    """Run the affordance model on the newest up color frame, in its own thread.
+
+    Parameters
+    ----------
+    ckpt : Path
+        AffordGlide checkpoint.
+    heat_out, bev_out : StreamMonitor
+        Receive the overlay and BEV images (``rgb8``), stamped with the color frame.
+
+    Notes
+    -----
+    Callbacks only store frames (:meth:`add_color`, :meth:`add_depth`, :meth:`set_k`),
+    so the model never blocks the ROS executor. The thread takes the newest color
+    frame (older ones are skipped if it falls behind), pairs it with the depth frame
+    nearest in header stamp (the up camera's depth often lags color by 33-65 ms) and
+    needs the color ``CameraInfo`` for the BEV; until then only the overlay is shown.
+    One update costs ~20 ms (model, GPU) + ~150 ms (BEV floor fit and projection).
+    """
+
+    def __init__(self, ckpt: Path, heat_out: StreamMonitor, bev_out: StreamMonitor) -> None:
+        from src.model.infer import HeatmapPredictor
+        self.predict = HeatmapPredictor(ckpt)
+        self.predict(np.zeros((360, 640, 3), np.uint8))     # warm up before frames arrive
+        self.heat_out, self.bev_out = heat_out, bev_out
+        self._color: tuple[float, np.ndarray] | None = None
+        self._depth: deque[tuple[float, np.ndarray]] = deque(maxlen=12)
+        self._k: np.ndarray | None = None
+        self._cv = threading.Condition()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        with self._cv:
+            self._stop = True
+            self._cv.notify()
+        self._thread.join(timeout=2.0)
+
+    def add_color(self, img: np.ndarray, stamp: float) -> None:
+        """Newest up color frame, (H, W, 3) uint8 RGB; replaces any not yet processed."""
+        with self._cv:
+            self._color = (stamp, img)
+            self._cv.notify()
+
+    def add_depth(self, img: np.ndarray, stamp: float) -> None:
+        """Up depth frame, (H, W) uint16 mm."""
+        with self._cv:
+            self._depth.append((stamp, img))
+
+    def set_k(self, k: np.ndarray) -> None:
+        """Color intrinsics (3, 3), px. Depth is registered to color."""
+        with self._cv:
+            self._k = k
+
+    def _run(self) -> None:
+        from src.model.bev import UpFrame
+        from src.model.infer import bev_image, overlay
+        while True:
+            with self._cv:
+                while self._color is None and not self._stop:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                stamp, rgb = self._color
+                self._color = None
+                depth = min(self._depth, key=lambda d: abs(d[0] - stamp), default=None)
+                k = self._k
+            heat: np.ndarray = self.predict(rgb)                   # (H, W) in [0, 1]
+            self.heat_out.add(overlay(rgb, heat), "rgb8", stamp)
+            if depth is not None and k is not None and depth[1].shape == rgb.shape[:2]:
+                frame = UpFrame(0.0, rgb, depth[1], k, depth[0] - stamp)
+                img, _ = bev_image(frame, heat)
+                self.bev_out.add(img, "rgb8", stamp)
+
+
 def build_window(monitors: Sequence[StreamMonitor], depth_max: float,
                  ) -> tuple["matplotlib.figure.Figure", Callable[[int], list]]:
     """Make the viewer figure and the function that refreshes its panels.
@@ -475,6 +572,9 @@ def parse_args(argv: Sequence[str] | None) -> tuple[argparse.Namespace, list[str
     p.add_argument("--depth-max", type=float, default=5.0, help="depth colour range, m")
     p.add_argument("--no-detections", action="store_true",
                    help="don't run ObjectDetection on color frames (no detection row)")
+    p.add_argument("--affordance", nargs="?", const="latest", default=None, metavar="CKPT",
+                   help="replace the detection row with the affordance heatmap (left) and "
+                        "its BEV (right); CKPT defaults to the newest data/runs/*/best.pt")
     return p.parse_known_args(argv)
 
 
@@ -498,14 +598,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Color stream name -> monitor of its detector output (third row).
     detections: dict[str, StreamMonitor] = {}
     detector = None
-    if not args.no_detections:
+    worker: AffordanceWorker | None = None
+    affordance: list[StreamMonitor] = []
+    if args.affordance is not None:
+        from src.model.infer import latest_checkpoint
+        ckpt = latest_checkpoint() if args.affordance == "latest" else Path(args.affordance)
+        print(f"affordance model: {ckpt}")
+        up_c, up_d = GLIDE_STREAMS["up_color"], GLIDE_STREAMS["up_depth"]
+        affordance = [StreamMonitor(CameraStream("up_heatmap", up_c.base_topic, "affordance"),
+                                    args.thumbs),
+                      StreamMonitor(CameraStream("up_bev", up_d.base_topic, "affordance"),
+                                    args.thumbs)]
+        worker = AffordanceWorker(ckpt, *affordance)
+    elif not args.no_detections:
         from src.img_processing.obj_detection import ObjectDetection
         detector = ObjectDetection()
         # Warm up (model load to GPU, first-call setup) before frames arrive.
         detector.apply_bounding_boxes(np.zeros((360, 640, 3), np.uint8))
         detections = {m.stream.name: StreamMonitor(detection_stream(m.stream), args.thumbs)
                       for m in sources if m.stream.kind == "color"}
-    monitors = sources + list(detections.values())
+    monitors = sources + list(detections.values()) + affordance
 
     rclpy.init(args=["viewer", *ros_args])
     node = Node("camera_stream_viewer")
@@ -525,6 +637,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                                  qos_profile_sensor_data)
         node.get_logger().info(f"{m.stream.name}: subscribed to {m.stream.base_topic}"
                                + (f" (+ {det.stream.name})" if det else ""))
+    if worker is not None:
+        from sensor_msgs.msg import CameraInfo
+        up_c, up_d = GLIDE_STREAMS["up_color"], GLIDE_STREAMS["up_depth"]
+        node.create_subscription(
+            Image, up_c.base_topic,
+            lambda msg: worker.add_color(image_to_numpy(msg), stamp_to_sec(msg.header.stamp)),
+            qos_profile_sensor_data)
+        node.create_subscription(
+            Image, up_d.base_topic,
+            lambda msg: worker.add_depth(image_to_numpy(msg), stamp_to_sec(msg.header.stamp)),
+            qos_profile_sensor_data)
+        if up_c.info_topic:
+            node.create_subscription(
+                CameraInfo, up_c.info_topic,
+                lambda msg: worker.set_k(np.array(msg.k, float).reshape(3, 3)),
+                qos_profile_sensor_data)
+        worker.start()
+        node.get_logger().info(f"affordance: {up_c.base_topic} + {up_d.base_topic} "
+                               f"+ {up_c.info_topic}")
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
@@ -582,6 +713,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if worker is not None:
+            worker.stop()
         if recorder is not None:
             recorder.close()
         executor.shutdown()
