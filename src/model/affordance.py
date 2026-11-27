@@ -100,7 +100,7 @@ class AffordGlide(nn.Module):
     Uses a YOLO backbone to produce feature maps via
     Feature Pyramid Networks (FPN). 
     """
-    def __init__(self):
+    def __init__(self, img_h: int = 384, img_w: int = 640):
         super().__init__()
 
         self._feature_extractor = YOLO("yolo26n.pt").model
@@ -134,14 +134,22 @@ class AffordGlide(nn.Module):
         self._p5_upsample = nn.Upsample(scale_factor=4)
         self._p4_upsample = nn.Upsample(scale_factor=2)
 
+        linear_size = 1 * img_h * img_w
         self.heatmap_head = nn.Sequential(
+            nn.Conv2d(
+                in_channels=self._final_output_channels * 3, 
+                out_channels=self._final_output_channels * 3,
+                kernel_size=3,
+                padding=1,
+            ),
+            nn.SiLU(),
             nn.Conv2d(
                 in_channels=self._final_output_channels * 3, 
                 out_channels=1,
                 kernel_size=3,
                 padding=1,
             ),
-            nn.Upsample(scale_factor=8),
+            nn.Upsample(scale_factor=8, mode="bilinear"),
         )
 
     def train(self, mode: bool = True) -> "AffordGlide":
