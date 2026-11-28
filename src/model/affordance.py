@@ -134,7 +134,6 @@ class AffordGlide(nn.Module):
         self._p5_upsample = nn.Upsample(scale_factor=4)
         self._p4_upsample = nn.Upsample(scale_factor=2)
 
-        linear_size = 1 * img_h * img_w
         self.heatmap_head = nn.Sequential(
             nn.Conv2d(
                 in_channels=self._final_output_channels * 3, 
