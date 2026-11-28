@@ -10,10 +10,14 @@ dependencies = [
     "pillow>=10",
     "mcap>=1.6.0",
     "mcap-ros2-support>=0.6.0",
+    "pyyaml>=6.0.4",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "ipython>=8.39.0",
+    "pytest>=8",
+]
 # Model code (src/). Keep torch, torchvision and ultralytics on the same versions as the
 # glide_ros conda env (env/ros_humble.yml). PyPI's Linux torch is the CUDA build. Skipped
 # on Intel Macs and Python 3.10, which have no wheels for current PyTorch.

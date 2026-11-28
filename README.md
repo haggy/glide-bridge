@@ -104,6 +104,59 @@ The robot's data-collection mode also records MCAP bags to `/data` at about 2 fp
 ./glide_robot.sh pull-bags 3           # 3 newest finished bags -> data/bags/
 ```
 
+### Data collection + local costmap (`nav` mode)
+
+Glidance's data-collection config leaves Nav2 and the obstacle filters off, so there is
+no costmap. The normal config has the costmap but only 424x240 color, and its depth
+isn't registered to color. `nav` mode combines the two. It gives:
+
+- data-collection cameras (640x360, depth registered to color, 6 fps, `_rfps` topics);
+- `/bag_record` and the record button;
+- plus Glidance's local costmap (`/local_costmap/costmap`: 7x7 m, 0.05 m cells, 7 Hz).
+
+The bags also record the costmap, `/cmd_vel` and TF. `goals_orchestrator` stays off,
+so Nav2 gets no goals: its controller stays idle and only the costmap runs.
+
+Nothing in `/shared`, `bringup.sh` or the systemd units is changed. `nav config` reads
+Glidance's two configs on the robot and writes a combined
+`/data/glide_link/glide_alpha2_dc_nav.yaml` (`robot/make_nav_config.py`). `nav start`
+runs that config **by hand, outside systemd**, in place of `glide_launch.service`.
+Because of that, a reboot returns the robot to its normal boot config, and a crash
+isn't restarted.
+
+1. **Put Glide on its kickstand.** `robot_controller` is active, as in normal
+   data-collection mode, so anything published on `/cmd_vel` reaches the steering and
+   brakes.
+2. **Stop the cloud uploader and deploy** (first time, and after any change to `robot/`):
+   ```bash
+   ./glide_robot.sh uploader stop
+   ./glide_robot.sh deploy          # copies the relay and make_nav_config.py to /data/glide_link
+   ./glide_robot.sh nav config      # builds glide_alpha2_dc_nav.yaml on the robot
+   ```
+3. **Switch to `nav` mode:**
+   ```bash
+   ./glide_robot.sh nav start       # stops glide_launch.service, launches the combined config
+   ./glide_robot.sh nav status      # costmap nodes, costmap rate, map -> base_footprint TF
+   ./glide_robot.sh nav log         # launch output (/data/glide_link/nav.log)
+   ```
+   Nav2 starts 5 s after the launch, then its nodes still have to come up. Give it
+   about 20 s before running `nav status`.
+4. **Record** as in [On-robot bags](#on-robot-bags): long-press the left button, or
+   `./glide_robot.sh bag start | bag stop`. Then `pull-bags`. The relay
+   (`./glide_robot.sh start`) also works in this mode.
+5. **Switch back:** `./glide_robot.sh nav stop` ends the launch and restarts
+   `glide_launch.service`. Then `./glide_robot.sh uploader start` if the lab wants the
+   uploader back on. After a reboot, run `nav start` again; `nav config` only needs
+   rerunning after `deploy`.
+
+First-run checks (all of this is untested on the robot):
+
+- `nav status` shows a `map -> base_footprint` transform; the costmap's
+  `global_frame` is `map`.
+- A long-press still plays the recording sound.
+- `top` shows the CPU keeping up: point clouds, filters and Nav2 now run alongside
+  recording.
+
 ## Using it from code
 
 ```python
@@ -211,7 +264,8 @@ The Gazebo sim can also be read through rosbridge (`--backend rosbridge`,
 | --- | --- |
 | `robot/glide_link_relay.py` | relay: ROS 2 topics -> TCP, encodes images, serves many clients |
 | `robot/run_relay.sh` | starts the relay with the robot service's DDS environment |
-| `glide_robot.sh` | laptop helper: deploy/start/stop relay, uploader, bags, info |
+| `robot/make_nav_config.py` | runs on the robot: builds the data-collection + costmap config for `nav` mode |
+| `glide_robot.sh` | laptop helper: deploy/start/stop relay, uploader, bags, `nav` mode, info |
 | `fetch_bags.sh` | download bags from the project Google Drive (rclone) |
 | `glide_bridge/ros/` | ROS 2 nodes: MCAP replay onto the robot's camera topics, matplotlib stream viewer |
 | `demos/` | runnable visual checks (`stream_demo.sh`, synthetic bag generator) |
@@ -233,5 +287,13 @@ The Gazebo sim can also be read through rosbridge (`--backend rosbridge`,
 - **Relay sees no topics at all**: it must use the same DDS settings as the stack.
   `run_relay.sh` assumes the normal service (Cyclone, localhost). For CARLA overlays,
   see the comment at the top of `run_relay.sh`.
+- **`nav status`: no costmap messages.**
+  - If there is no `map -> base_footprint` transform, the costmap can't activate.
+    Check `nav log`. The fix is `global_frame: odom` for the local costmap.
+  - If the controller_server node is missing, Nav2 hasn't started yet, or it failed:
+    see `nav log`.
+- **`nav stop`: `glide_launch.service` stays inactive.** The service only starts if
+  `/run/glide-transport/ALLOW_NAVIGATION` exists (see the Glide Troubleshooting Log).
+  Create the flag, or reboot.
 - **Low frame rate or many drops**: lower `--rate`, record fewer streams, or move
   closer to the access point. The robot's cameras run at 6 fps in both configs.

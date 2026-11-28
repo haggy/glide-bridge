@@ -9,3 +9,4 @@ Requires-Dist: matplotlib>=3.8
 Requires-Dist: pillow>=10
 Requires-Dist: mcap>=1.6.0
 Requires-Dist: mcap-ros2-support>=0.6.0
+Requires-Dist: pyyaml>=6.0.4
